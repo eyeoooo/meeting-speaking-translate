@@ -69,6 +69,16 @@ ECHO_PLAYBACK_GRACE_SECONDS = 3.0
 # 翻译子任务收尸限时：超时强杀后 SDK 清理若悬挂，弃车保帅——
 # 工作者必须活着（2026-07-31 实锤：一次悬挂让其后所有句子全部静音）。
 TRANSLATE_REAP_SECONDS = 2.0
+# 迟到句丢弃：一次超时/网络抖动会让队列积压，稍后"一口气补播"
+# 二三十秒前的话——真人复验实锤，用户听感即"大量没说过的内容"。
+# 同传里迟到的话只制造混乱，超龄整句丢弃。
+STALE_UTTERANCE_SECONDS = 12.0
+# 幻听语速闸：ASR 对噪声/静默的幻听常表现为"极短音频配长文本"。
+# 中日文正常语速 5-10 字/秒，超过 16 字/秒即物理不可能。
+HALLUCINATION_MAX_CHARS_PER_SEC = 16.0
+# 噪声碎片哨兵：翻译模型对无意义碎片按铁律输出 ∅，代码层静默丢弃
+# ——宁可沉默，绝不把「すんご」脑补成「ハイ」。
+NOISE_SENTINEL = "∅"
 
 _ECHO_STRIP = re.compile(r"[\s。、．，,.！？!?：:；;「」『』()（）\-]")
 
@@ -163,11 +173,15 @@ def build_translation_system(glossary: str) -> str:
         "9. 原文是半句、词语或片段时，输出对应的日语半句/词语/片段。"
         "宁可输出不完整的半句，也绝不替说话人补全句子、绝不添加原文"
         "中不存在的动词、宾语、客套语或收尾——说了多少就译多少。\n"
+        "10. 原文若是无法构成词语的噪声碎片（转写事故），只输出一个"
+        "字符 ∅——宁可沉默，绝不猜测或脑补成任何词句。\n"
         "示例（必须严格模仿的行为）：\n"
         "原文「本日はお忙しいところ」→ 本日はお忙しいところ\n"
         "（半句保持半句，绝不补「ありがとうございます」）\n"
         "原文「納品」→ 納品\n"
         "（单词保持单词，绝不补「いたします」）\n"
+        "原文「すんご.」→ ∅\n"
+        "（噪声碎片沉默，绝不脑补成「はい」之类）\n"
         "原文「今」→ いま\n"
         "（孤立的单个汉字用假名表记——朗读语言才稳定；两字以上的"
         "常用词保持汉字）\n"
@@ -321,6 +335,10 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         self._recent_speech: deque[tuple[float, str]] = deque(
             maxlen=ECHO_RECENT_SENTENCES
         )
+        # 语音时长队列（server VAD 的 started/stopped 到达间隔）：
+        # 幻听语速闸的分母。completed 与 stopped 一一对应地出队。
+        self._speech_started_at: float | None = None
+        self._speech_durations: deque[float] = deque(maxlen=8)
 
     @property
     def system_prompt(self) -> str:
@@ -354,6 +372,16 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
 
     def handle_server_event(self, event: dict[str, Any]) -> bool:
         event_type = event.get("type")
+        if event_type == "input_audio_buffer.speech_started":
+            self._speech_started_at = time.monotonic()
+            return False
+        if event_type == "input_audio_buffer.speech_stopped":
+            if self._speech_started_at is not None:
+                self._speech_durations.append(
+                    time.monotonic() - self._speech_started_at
+                )
+                self._speech_started_at = None
+            return False
         if event_type == "conversation.item.input_audio_transcription.delta":
             # 面板显示走既有断句链（含草稿语义）；翻译不用 delta。
             self._consume_text_delta("source", event.get("delta"), None)
@@ -366,10 +394,20 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
             # 面板残句（expressive 同款手法）。翻译取 completed 全文——
             # utterance 级整句是翻译质量的最小单元。
             self._consume_text_delta("source", "\n", None)
+            duration = (
+                self._speech_durations.popleft()
+                if self._speech_durations
+                else None
+            )
             transcript = event.get("transcript")
             if isinstance(transcript, str) and transcript.strip():
                 text = transcript.strip()
-                if self._is_self_echo(text):
+                if self._looks_like_hallucination(text, duration):
+                    print(
+                        f"[cascade] 疑似幻听（语速异常），已忽略：{text[:48]}",
+                        flush=True,
+                    )
+                elif self._is_self_echo(text):
                     # 回环不进翻译、不出声；打进日志供事后归因。
                     print(
                         f"[cascade] 疑似自回声，已忽略：{text[:48]}",
@@ -404,12 +442,13 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         self._ensure_translator()
         # 逐位数字串确定性直通：不进翻译模型（防连写/复读/递增），
         # 不进滚动上下文（对术语一致性无价值，还会被模型回声）。
+        now = time.monotonic()
         if len(text) >= 2 and _DIGIT_READOUT_RE.match(text):
             rendered = render_digit_readout(text)
             if rendered:
-                self._translation_queue.put_nowait(("digits", rendered))
+                self._translation_queue.put_nowait(("digits", rendered, now))
                 return
-        self._translation_queue.put_nowait(("text", text))
+        self._translation_queue.put_nowait(("text", text, now))
 
     def _ensure_translator(self) -> None:
         if self._translator_task is None or self._translator_task.done():
@@ -424,6 +463,9 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         async for delta in stream:
             if not isinstance(delta, str) or not delta:
                 continue
+            # 噪声哨兵：模型按铁律 10 对噪声碎片输出 ∅——静默丢弃本句。
+            if NOISE_SENTINEL in delta:
+                return ""
             # 出口谚文防火墙（流式版）：异常字符立即中止本句。
             if _HANGUL_RE.search(delta):
                 raise RuntimeError("译文出现异常字符（谚文）")
@@ -453,7 +495,16 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         # 悬挂，把工作者整个卡死——其后所有句子（任何语言）全部静音，
         # 用户体感"日语被过滤"。超时强杀 + 收尸限时，工作者必须活着。
         while True:
-            kind, text = await self._translation_queue.get()
+            kind, text, enqueued_at = await self._translation_queue.get()
+            # 迟到句丢弃：积压后"一口气补播"二三十秒前的话只制造混乱
+            # （真人复验实锤，用户体感"大量没说过的内容"）。
+            age = time.monotonic() - enqueued_at
+            if age > STALE_UTTERANCE_SECONDS:
+                print(
+                    f"[cascade] 丢弃迟到 {age:.0f}s 的句子：{text[:32]}",
+                    flush=True,
+                )
+                continue
             if kind == "digits":
                 # 数字直通：零模型、零延迟、零幻觉。
                 self._consume_text_delta("translation", text + "\n", None)
@@ -489,7 +540,7 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                 # 流式路径已发布并入上下文。
                 continue
             translated = (translated or "").strip()
-            if not translated:
+            if not translated or NOISE_SENTINEL in translated:
                 continue
             # 出口防火墙：译文里出现谚文同样按事故丢弃。
             if _HANGUL_RE.search(translated):
@@ -516,6 +567,19 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                 name="cascade-translate",
             )
         return task
+
+    @staticmethod
+    def _looks_like_hallucination(
+        transcript: str,
+        duration: float | None,
+    ) -> bool:
+        """极短音频配长文本=ASR 幻听（静默期客套句的典型形态）。"""
+        if duration is None:
+            return False
+        chars = len(_normalize_for_echo(transcript))
+        if duration < 0.2:
+            return chars >= 8
+        return chars / duration > HALLUCINATION_MAX_CHARS_PER_SEC
 
     def _is_self_echo(self, transcript: str) -> bool:
         now = time.monotonic()

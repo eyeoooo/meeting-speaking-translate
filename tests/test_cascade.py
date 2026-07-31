@@ -504,6 +504,158 @@ class CascadeStreamingTranslatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["两句话的发言"], calls)
 
 
+class CascadeNoiseGateTests(unittest.IsolatedAsyncioTestCase):
+    def _make(self, server, tts_session, translator_factory):
+        output = SpyOutputPlayer()
+        state = InterpreterState(
+            enabled=True,
+            lang="ja",
+            interpret_voice=True,
+        )
+        segments: list = []
+        client = CascadeSpeechSession(
+            Tap("rehearsal", maxsize=8, drop_oldest=True),
+            output,
+            api_key="mock-key-never-sent-to-openai",
+            anthropic_api_key="ant-mock-key",
+            elevenlabs_api_key="el-mock-key",
+            voice_id="voice-clone-1",
+            safety_identifier="hashed-test-user",
+            url=server.url,
+            state=state,
+            on_sentence=segments.append,
+            session_factory=server.session_factory,
+            translator_factory=translator_factory,
+            tts_session_factory=lambda: tts_session,
+        )
+        return client, output, segments
+
+    async def test_stale_utterances_are_dropped_not_replayed(self) -> None:
+        # 真人复验实锤：积压后"一口气补播"二三十秒前的话，用户体感
+        # "大量没说过的内容"。超龄句整句丢弃。
+        events = [
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "新鲜的句子",
+            },
+        ]
+        server = MockRealtimeServer(_transcription_script(events))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(CLONE_PCM,))])
+        calls: list = []
+        client, output, _ = self._make(
+            server, tts, _fake_translator_factory(["新しい文です。"], calls)
+        )
+        # 预埋一条 100s 前入队的迟到句
+        client._translation_queue.put_nowait(
+            ("text", "迟到的句子", time.monotonic() - 100.0)
+        )
+
+        task = client.start()
+        await _wait_until(lambda: len(tts.requests) >= 1)
+        await client.stop()
+        await task
+
+        sentence_calls = [c for c in calls if isinstance(c, tuple)]
+        self.assertEqual(
+            ["新鲜的句子"], [c[0] for c in sentence_calls]
+        )
+        self.assertEqual(1, len(tts.requests))
+
+    async def test_noise_sentinel_stays_silent(self) -> None:
+        # 铁律 10：噪声碎片模型输出 ∅，代码层静默丢弃——
+        # 绝不把「すんご」脑补成「ハイ」。
+        release = asyncio.Event()
+
+        def factory(api_key, model, system_text):
+            state = {"count": 0}
+
+            async def translate(text, context):
+                state["count"] += 1
+                if state["count"] == 1:
+                    yield "∅"
+                else:
+                    yield "本物の文です。"
+                    release.set()
+
+            return translate
+
+        events = [
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "すんご.",
+            },
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "真正的发言",
+            },
+        ]
+        server = MockRealtimeServer(_transcription_script(events))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(CLONE_PCM,))])
+        client, output, segments = self._make(server, tts, factory)
+
+        task = client.start()
+        await _wait_until(lambda: len(tts.requests) >= 1)
+        await client.stop()
+        await task
+
+        # 噪声句零输出；真句照常。
+        self.assertEqual(
+            ["本物の文です。"],
+            [request["json"]["text"] for request in tts.requests],
+        )
+        self.assertNotIn(
+            "∅", [s.text for s in segments]
+        )
+
+    async def test_speech_rate_hallucination_is_dropped(self) -> None:
+        # 幻听语速闸：极短音频（started/stopped 几乎同时）配长文本
+        # =ASR 幻听，整句丢弃；短词不受影响。
+        server = MockRealtimeServer(_transcription_script([]))
+        tts = _FakeTtsSession([])
+        calls: list = []
+        client, _, _ = self._make(
+            server, tts, _fake_translator_factory([], calls)
+        )
+
+        task = client.start()
+        # 极短音频 + 长文本 → 丢弃
+        client.handle_server_event(
+            {"type": "input_audio_buffer.speech_started"}
+        )
+        client.handle_server_event(
+            {"type": "input_audio_buffer.speech_stopped"}
+        )
+        client.handle_server_event({
+            "type": (
+                "conversation.item.input_audio_transcription.completed"
+            ),
+            "transcript": "貴社のご要望を理解いたしました。",
+        })
+        self.assertTrue(client._translation_queue.empty())
+        # 极短音频 + 短词（納品）→ 保留
+        client.handle_server_event(
+            {"type": "input_audio_buffer.speech_started"}
+        )
+        client.handle_server_event(
+            {"type": "input_audio_buffer.speech_stopped"}
+        )
+        client.handle_server_event({
+            "type": (
+                "conversation.item.input_audio_transcription.completed"
+            ),
+            "transcript": "納品",
+        })
+        self.assertFalse(client._translation_queue.empty())
+        await client.stop()
+        await task
+
+
 class CascadeWorkerSurvivalTests(unittest.IsolatedAsyncioTestCase):
     async def test_hanging_translation_does_not_kill_worker(self) -> None:
         # 2026-07-31 实锤：一次翻译调用在取消清理时悬挂，把单工作者
