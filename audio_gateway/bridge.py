@@ -1175,6 +1175,8 @@ def run_bridge(
     speak_engine: str = "translate",
     elevenlabs_api_key: str = "",
     clone_voice_id: str = "",
+    clone_model: str | None = None,
+    clone_speed: float | None = None,
 ) -> int:
     # 发言引擎白名单在一切资源分配之前判定：错误引擎名是配置事故，
     # 绝不能静默回退到任何一个引擎（回退=用户以为在 A/B 其实在 A/A）。
@@ -1637,7 +1639,7 @@ def run_bridge(
                 # M3 声纹克隆：文本链路与 translate 引擎逐字相同
                 # （translations 端点 + interpret_model），只把音频出口
                 # 换成 ElevenLabs 克隆声线（详见 voiceclone.py 模块头）。
-                from .voiceclone import CloneSpeechSession
+                from .voiceclone import DEFAULT_CLONE_MODEL, CloneSpeechSession
 
                 rehearsal = CloneSpeechSession(
                     rehearsal_tap,
@@ -1645,6 +1647,8 @@ def run_bridge(
                     api_key=openai_api_key,
                     elevenlabs_api_key=elevenlabs_api_key,
                     voice_id=clone_voice_id,
+                    clone_model=clone_model or DEFAULT_CLONE_MODEL,
+                    clone_speed=clone_speed,
                     lang="ja",
                     model=interpret_model,
                     state=rehearsal_state,

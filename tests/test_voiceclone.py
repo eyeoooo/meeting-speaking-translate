@@ -138,9 +138,24 @@ class CloneConstructionTests(unittest.TestCase):
                 voice_id="  ",
             )
 
+    def test_speed_out_of_range_fails_closed(self) -> None:
+        # ElevenLabs 只接受 0.7–1.2；越界在构造时炸，不留到会中才发现。
+        for bad in (0.5, 1.5):
+            with self.assertRaises(ValueError):
+                CloneSpeechSession(
+                    Tap("rehearsal"),
+                    SpyOutputPlayer(),
+                    api_key="mock-key",
+                    elevenlabs_api_key="el-key",
+                    voice_id="voice-1",
+                    clone_speed=bad,
+                )
+
 
 class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
-    def _make_client(self, server, tts_session, *, interpret_voice=True):
+    def _make_client(
+        self, server, tts_session, *, interpret_voice=True, **clone_kwargs
+    ):
         output = SpyOutputPlayer()
         state = InterpreterState(
             enabled=True,
@@ -160,6 +175,7 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
             on_sentence=segments.append,
             session_factory=server.session_factory,
             tts_session_factory=lambda: tts_session,
+            **clone_kwargs,
         )
         return client, output, segments
 
@@ -221,6 +237,8 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
                 DEFAULT_CLONE_MODEL,
                 request["json"]["model_id"],
             )
+            # 未指定语速时绝不发 voice_settings：用声线自带默认语速。
+            self.assertNotIn("voice_settings", request["json"])
         # 文本链路原样：source/translation 两条流都正常发布。
         self.assertEqual(
             [
@@ -254,6 +272,35 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([b"\x01\x02", b"\x03\x04"], output.chunks)
         for chunk in output.chunks:
             self.assertEqual(0, len(chunk) % 2)
+
+    async def test_model_and_speed_reach_request_body(self) -> None:
+        events = [
+            {
+                "type": "session.output_transcript.delta",
+                "delta": "はい。",
+                "elapsed_ms": 100,
+            },
+        ]
+        server = MockRealtimeServer(_translations_script(events))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(CLONE_PCM_A,))])
+        client, output, _ = self._make_client(
+            server,
+            tts,
+            clone_model="eleven_turbo_v2_5",
+            clone_speed=1.1,
+        )
+
+        task = client.start()
+        await _wait_until(lambda: len(output.chunks) >= 1)
+        await client.stop()
+        await task
+
+        request = tts.requests[0]
+        self.assertEqual("eleven_turbo_v2_5", request["json"]["model_id"])
+        self.assertEqual(
+            {"speed": 1.1},
+            request["json"]["voice_settings"],
+        )
 
     async def test_tts_failure_mutes_sentence_and_continues(self) -> None:
         events = [
@@ -437,6 +484,8 @@ class CloneWiringTests(unittest.TestCase):
         args = main.build_parser().parse_args([
             "bridge", "--speak", "--speak-engine", "clone",
             "--speak-voice-id", "voice-from-flag",
+            "--clone-model", "eleven_turbo_v2_5",
+            "--clone-speed", "1.1",
         ])
         with (
             patch.dict(
@@ -465,6 +514,11 @@ class CloneWiringTests(unittest.TestCase):
             "voice-from-flag",
             run.call_args.kwargs["clone_voice_id"],
         )
+        self.assertEqual(
+            "eleven_turbo_v2_5",
+            run.call_args.kwargs["clone_model"],
+        )
+        self.assertEqual(1.1, run.call_args.kwargs["clone_speed"])
 
 
 if __name__ == "__main__":

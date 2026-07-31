@@ -614,7 +614,9 @@ def cmd_bridge(args) -> int:
                       speak_device=speak_device,
                       speak_engine=getattr(args, "speak_engine", "translate"),
                       elevenlabs_api_key=elevenlabs_api_key,
-                      clone_voice_id=clone_voice_id)
+                      clone_voice_id=clone_voice_id,
+                      clone_model=getattr(args, "clone_model", None),
+                      clone_speed=getattr(args, "clone_speed", None))
 
 
 def cmd_micagent(args) -> int:
@@ -742,6 +744,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="clone 引擎的 ElevenLabs voice id（默认读环境变量 "
         "ELEVENLABS_VOICE_ID）",
+    )
+    b.add_argument(
+        "--clone-model",
+        default=None,
+        help="clone 引擎的 ElevenLabs 模型（默认 eleven_multilingual_v2；"
+        "低延迟可选 eleven_turbo_v2_5）",
+    )
+    b.add_argument(
+        "--clone-speed",
+        type=float,
+        default=None,
+        help="clone 引擎语速（0.7–1.2，默认用声线自带语速）",
     )
     b.add_argument(
         "--no-postprocess",

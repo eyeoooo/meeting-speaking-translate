@@ -27,6 +27,10 @@ from .interpreter import RealtimeInterpreter
 # 跨语言克隆用 multilingual v2：正确性/相似度优先（flash 系为低延迟档，
 # 音色相似度与韵律弱一档，若真实会议嫌慢再评测降档）。
 DEFAULT_CLONE_MODEL = "eleven_multilingual_v2"
+# ElevenLabs voice_settings.speed 的合法区间（官方文档 0.7–1.2）；
+# None=不发该字段，用声线自带默认语速。
+CLONE_SPEED_MIN = 0.7
+CLONE_SPEED_MAX = 1.2
 ELEVENLABS_TTS_URL = (
     "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
 )
@@ -53,6 +57,7 @@ class CloneSpeechSession(RealtimeInterpreter):
         elevenlabs_api_key: str,
         voice_id: str,
         clone_model: str = DEFAULT_CLONE_MODEL,
+        clone_speed: float | None = None,
         tts_session_factory: Callable[[], Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -62,10 +67,18 @@ class CloneSpeechSession(RealtimeInterpreter):
             )
         if not voice_id.strip():
             raise ValueError("clone voice id must be non-empty")
+        if clone_speed is not None and not (
+            CLONE_SPEED_MIN <= clone_speed <= CLONE_SPEED_MAX
+        ):
+            raise ValueError(
+                f"clone speed must be within [{CLONE_SPEED_MIN}, "
+                f"{CLONE_SPEED_MAX}], got {clone_speed}"
+            )
         super().__init__(audio_tap, output_player, api_key=api_key, **kwargs)
         self._el_api_key = elevenlabs_api_key.strip()
         self._voice_id = voice_id.strip()
         self._clone_model = clone_model
+        self._clone_speed = clone_speed
         self._tts_session_factory = tts_session_factory or (
             lambda: aiohttp.ClientSession()
         )
@@ -133,11 +146,17 @@ class CloneSpeechSession(RealtimeInterpreter):
             or not self._player_started
         ):
             return
+        body: dict[str, Any] = {
+            "text": sentence,
+            "model_id": self._clone_model,
+        }
+        if self._clone_speed is not None:
+            body["voice_settings"] = {"speed": self._clone_speed}
         async with session.post(
             ELEVENLABS_TTS_URL.format(voice_id=self._voice_id),
             params={"output_format": CLONE_OUTPUT_FORMAT},
             headers={"xi-api-key": self._el_api_key},
-            json={"text": sentence, "model_id": self._clone_model},
+            json=body,
         ) as response:
             if response.status != 200:
                 detail = (await response.text())[:200]
