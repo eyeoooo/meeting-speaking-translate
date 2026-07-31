@@ -1,8 +1,13 @@
-# Mac mini 物理隔离音频网关
+# 会议助手 —— Mac mini 会议中枢
 
-音频网关把被控机会议音频经 USB 声卡与 3.5mm 模拟线旁路到 Mac mini，
-目标电脑无需安装软件或驱动。当前产品边界是 **Mac mini 本机接收、播放、
-录音与 AI 处理闭环**：
+**对方说日语 → 我看中文字幕 + AI 参谋建议；我说中文/日语/英语 →
+对方听到"我自己声音"的日语**（克隆声线级联同传）；全程录音、
+会后自动生成纪要。形态 = 菜单栏原生 App（会议助手.app）+
+Python bridge（端口 8787，token 鉴权）+ 浮动字幕窗口（⌘J）。
+
+音源两种（菜单「声音来源」）：**本机会议软件**（Teams/Zoom 经
+BlackHole 虚拟声卡）或**外部设备**（USB 声卡 + 3.5mm 模拟线旁路，
+如 KVM 被控机——目标电脑无需安装任何软件或驱动）。整体链路：
 
 ```text
 【音源】(本机 Teams/Zoom 经 BlackHole，或外部设备/被控机经 USB 声卡)
@@ -92,7 +97,12 @@ cd ~/audio-gateway
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 brew install switchaudio-osx
+# 「本机会议软件（Teams/Zoom）」模式需要 BlackHole 虚拟声卡：
+brew install blackhole-2ch blackhole-16ch
 ```
+
+（通过 `app/build-apps.sh` 构建的 会议助手.app 自带 Python 运行时，
+新机器首启会自动完成上面的 venv 与依赖安装，无需 Homebrew Python。）
 
 可选 AI 能力：
 
@@ -261,7 +271,7 @@ bridge、doctor 或字幕窗口的工程前提。若 Mac mini 本机可听但操
 
 `bridge --interpret` 把 `Mac_In` 的会议原声送入 OpenAI Realtime translation，
 接收日语原文、中文译文和可选中文语音。默认形态是：**Mac mini 本机播放会议
-原声、原生字幕窗口显示双语字幕（服务端保留最近 50 句/流可补拉）、译文语音关闭**。
+原声、原生字幕窗口显示双语字幕（服务端保留最近 60 句/流可补拉）、译文语音关闭**。
 
 ```bash
 export OPENAI_API_KEY="<API key>"
@@ -278,10 +288,15 @@ export OPENAI_API_KEY="<API key>"
 - 译文设备不得解析为 `USB Audio Device` / Mac_Out；命中时 fail-closed。
 - 同传失败只影响同传任务，原声监听和录音继续。
 
-双语字幕按 source/translation 到达顺序配对。每句以
-`{"type":"sentence", ...}` 推送；新连接和重连通过
-`GET /history?t=<TOKEN>` 补拉最近 50 句。`/status` 与 WS state 的
-`interpreter` 字段包含 `history_len`、`interpret_voice`、`gated` 和错误状态。
+双语字幕是**两条独立泳道**：Realtime translations 协议没有任何
+source↔translation 关联字段（实测一场会 163 原文:134 译文），任何
+按序配对都是猜测——原文与译文各自按到达顺序独立显示，绝不逐行配对。
+每句以 `{"type":"segment", "id", "stream", "text", "t", "elapsed_ms",
+"epoch"}` 推送（append-only）；未成句的转写中间态另以
+`{"type":"segment_draft", ...}` 灰字先行（可变态，不进历史）。
+新连接和重连通过 `GET /history?t=<TOKEN>` 补拉（每流保留最近 60 句）。
+`/status` 与 WS state 的 `interpreter` 字段包含 `history_len`、
+`interpret_voice`、`gated` 和错误状态。
 
 ### 4.1 VAD 省费门控
 
@@ -317,6 +332,27 @@ brief 支持会中热重载：每次调用前按 mtime 比对，改完文件即�
 `/status` 与 WS state 的 `advisor` 字段包含
 `calls/delivered/suppressed/last_call_t/last_advice_t/last_error/backoff_until/brief_mismatch`；
 错误文本已脱敏。失败会挂一条「参谋:」前缀的降级告警，成功后自动清除。
+
+### 4.3 发言方向（排练 / 正式发言 / 我的声音）
+
+菜单勾选即可：「发言排练」= 你的日语只进自己耳机（零会议风险，
+练习与验收用）；「正式发言」= 日语注入会议（`m` 键静音是刹车）；
+「发言声音」= 标准声线或「我的声音」（cascade 级联，需要
+`ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID` + `ANTHROPIC_API_KEY`）。
+
+级联链路：转写（gpt-4o-transcribe + 内置商务热词 + brief.md 术语）→
+Claude 翻译（服务方敬语、滚动上下文、说多少译多少）→ 用户克隆声线。
+入口语言自由（中/英→译日、日语→原样直通、混说→合译整句），
+逐位数字串由代码直通渲染「1、2、3、4、5」。八道确定性防线：
+自回声（播放窗口内）、迟到丢弃（>12s）、噪声哨兵（∅）、幻听语速闸、
+谚文防火墙、同句去重、数字直通、翻译工作者防猝死。
+
+命令行排练入口（Mac mini 本机 Terminal，SSH 采不到麦克风）：
+
+```bash
+.venv/bin/python -m audio_gateway bridge --rehearse --speak-engine cascade \
+  --record --no-postprocess --token TEST --port 8898
+```
 
 ## 5. CLI 与生命周期
 
@@ -413,15 +449,14 @@ Whisper 段落标为 `"source":"batch"`。`/status` 在整个生命周期公开
 [A7 隔离审计](docs/isolation-audit.md)。
 
 ```bash
-cd audio-gateway
-.venv/bin/python -m unittest discover -s tests
-
-cd ../frontend
-bun test
-bunx tsc --noEmit
+.venv/bin/python -m pytest tests/ -q
 ```
 
-仓库级 `bun run test:product` 是发布/部署前 no-bypass 硬门。
+（在仓库根目录运行；当前基线 234 passed。）Swift 壳的编译门禁：
+
+```bash
+cd app && swiftc -warnings-as-errors -parse-as-library -typecheck GatewayMenuBar.swift MeetingCaptionsWindow.swift
+```
 
 ## 附录 A. 预留：发言链路（等远程渠道支持麦克风直连）
 
