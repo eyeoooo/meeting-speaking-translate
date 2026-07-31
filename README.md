@@ -14,6 +14,12 @@
                                                    ├─ Realtime 同传 / 参谋
                                                    └─ 原生字幕窗口
 
+【发言方向】（M2/M3，2026-07-31 真人复验转正）
+耳麦中文/日语/英语 → 转写(热词) → Claude 翻译(敬语/术语) →
+  用户克隆声线(ElevenLabs) → 会议(BlackHole 16ch / Mac_Out)
+  · 出口恒为日语：中/英→译日，日语→原样直通，混说→合译整句
+  · 八道确定性防线：回声/迟到/噪声/幻听/谚文/重复/数字直通/工作者防猝死
+
 【操作者】── 任意远程桌面渠道 ──▶ 看见并听见 Mac mini
 ```
 
@@ -23,8 +29,14 @@
 
 远程桌面渠道只是访问 Mac mini 的方式，不是音频网关的组件、依赖或协议。
 网关的产品验收终点是 Mac mini 本机正确播放与处理；渠道侧的画面、系统声音转送
-和耳机选择由操作者按所用渠道配置。当前产品不发布发言入口，保留资产与恢复方法
-集中在 [预留附录](#附录-a-预留发言链路等远程渠道支持麦克风直连)。
+和耳机选择由操作者按所用渠道配置。
+
+发言方向（在 Mac mini 本机用耳麦发言）已是产品能力：菜单「发言排练」只进
+自己耳机、「正式发言」把日语注入会议，「发言声音」可选标准声线或
+「我的声音」（cascade 级联：自建转写 + Claude 翻译 + 用户克隆声线）。
+仍在封存的只有**远程麦克风客户端**（micagent，操作者从远端机器发言），
+其资产与恢复方法集中在
+[预留附录](#附录-a-预留发言链路等远程渠道支持麦克风直连)。
 
 产品运行闭包由三部分组成：
 
@@ -93,9 +105,12 @@ LLM 后端可独立选择：
 
 | 能力 | 默认后端 | 凭据 / 选项 |
 |---|---|---|
-| 同传 | OpenAI Realtime | `OPENAI_API_KEY`、`--interpret-model` |
+| 同传（收听） | OpenAI Realtime | `OPENAI_API_KEY`、`--interpret-model` |
 | 参谋 | Claude | `ANTHROPIC_API_KEY`、`--advise` |
 | 会后纪要 | Claude | `ANTHROPIC_API_KEY`；也可选 OpenAI/Ollama |
+| 发言转写（级联） | OpenAI gpt-4o-transcribe | `OPENAI_API_KEY`（热词来自内置商务词表 + `~/AudioGateway/brief.md`） |
+| 发言翻译（级联） | Claude Haiku | `ANTHROPIC_API_KEY`、`--cascade-translate-model` |
+| 克隆声线 | ElevenLabs | `ELEVENLABS_API_KEY`、`ELEVENLABS_VOICE_ID`（或 `--speak-voice-id`） |
 
 Codex CLI 的 `~/.codex/auth.json` 是 ChatGPT OAuth 会话，**不是** API key。
 基础接收、播放、录音和字幕/调试面不要求 Whisper 或 LLM 凭据。
@@ -115,10 +130,11 @@ cd ~/audio-gateway/app
 
 | App | 作用 |
 |---|---|
-| **会议助手.app** | 同传/会议产品。双击 = 菜单栏会议服务就位。菜单：开始这场会议（⌘R）/ 测试声音（5 秒）/ 结束会议并生成纪要（⌘.）/ 取消这次录音 / 声音来源（本机会议软件 / 外部设备）/ 实时中文字幕 + AI 建议开关 / 打开字幕窗口（⌘J）/ 打开最近一次纪要 / 打开会议文件夹 / 帮助与诊断。字幕在**原生字幕窗口**呈现，不依赖浏览器。bundle id 沿用 `dev.controller-agent.audio-gateway`，麦克风 TCC 授权连续 |
+| **会议助手.app** | 同传/会议产品。双击 = 菜单栏会议服务就位。菜单：开始这场会议（⌘R）/ 测试声音（5 秒）/ 结束会议并生成纪要（⌘.）/ 取消这次录音 / 静音发言（m，仅正式发言会议）/ 声音来源（本机会议软件 / 外部设备）/ 实时中文字幕 + AI 建议开关 / 发言排练（只进我的耳机）/ 正式发言（对方听到日语）/ 发言声音（标准声音 / 我的声音）/ 打开字幕窗口（⌘J）/ 打开最近一次纪要 / 打开会议文件夹 / 帮助与诊断。字幕在**原生字幕窗口**呈现，不依赖浏览器。App 自带 Python 运行时（新机免 Homebrew）。bundle id 沿用 `dev.controller-agent.audio-gateway`，麦克风 TCC 授权连续 |
 | **KVM 控制台.app** | 纯 KVM 薄启动器。双击 = 打开 KVM 控制台网页（Chrome PWA 优先、降级默认浏览器，`#kvm` 自动登录）后即退出。全新 bundle id `dev.controller-agent.kvm-console`，无麦克风权限声明 |
 
-默认构建不会产出预留发言客户端，菜单也不显示发言静音或客户端命令。
+默认构建不会产出预留的**远程麦克风客户端**（micagent）。本机发言
+（排练/正式发言/发言声音）是产品菜单的一部分，与该封存资产无关。
 
 **KVM 控制台窗口形态**：启动器优先启动 Chrome PWA（`~/Applications/Chrome Apps.localized/`
 下名字含 `KVM` 的 app）——独立窗口、无地址栏、沿用 Chrome 默认 profile（摄像头等授权继承）。
@@ -323,7 +339,19 @@ audio_gateway bridge [--port PORT] [--token TOKEN] [--record]
                      [--interpret-model MODEL]
                      [--interpret-vad-dbfs DBFS|off]
                      [--advise] [--skip-doctor]
+                     [--rehearse | --speak] [--speak-device KEYWORD]
+                     [--speak-engine translate|expressive|clone|cascade]
+                     [--speak-voice-id VOICE_ID]
+                     [--clone-model MODEL] [--clone-speed 0.7-1.2]
+                     [--cascade-translate-model MODEL]
+                     [--rehearse-replay WAV] [--replay WAV]
 ```
+
+发言引擎裁定（详见 `docs/speak-engine-ab-20260731.md`）：`translate`
+为 CLI 默认与回退；菜单「我的声音」= `cascade`（真人复验转正）；
+`expressive` 因"编造对话轮次"红线永不转正，仅留作 A/B 工程口；
+`clone` 为 cascade 的前身，留作对照。工程 A/B 驱动：
+`python -m audio_gateway.abtest --wav <语料> --engines translate,cascade`。
 
 日常停止用音频网关菜单。HTTP 等价入口：
 

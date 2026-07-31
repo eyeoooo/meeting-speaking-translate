@@ -79,9 +79,10 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         title: "外部设备（USB 声卡 / 被控机）", action: #selector(useExternalSource), keyEquivalent: "")
     private let rehearseToggle = NSMenuItem(title: "发言排练（只进我的耳机）", action: #selector(toggleRehearse), keyEquivalent: "")
     private let speakToggle = NSMenuItem(title: "正式发言（对方听到日语）", action: #selector(toggleSpeak), keyEquivalent: "")
-    // 发言声音（M3）：标准=端点内置声线（正确性优先默认）；我的声音=
-    // ElevenLabs 克隆（2026-07-31 用户听感验收通过）。expressive 引擎因
-    // 真人复验红线（编造对话轮次）不进产品菜单，仅保留工程 CLI。
+    // 发言声音：标准=translations 端点内置声线；我的声音=cascade 级联
+    // （自建转写+Claude 翻译+用户克隆声线，2026-07-31 多轮真人复验转正
+    // ——识别、延迟、防加戏八道闸全套）。clone/expressive 引擎仅保留
+    // 工程 CLI，不进产品菜单。
     private let voiceHeader = NSMenuItem(title: "发言声音", action: nil, keyEquivalent: "")
     private let voiceStandardItem = NSMenuItem(
         title: "标准声音", action: #selector(useStandardVoice), keyEquivalent: "")
@@ -365,10 +366,10 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         if subtitlesEnabled && adviceEnabled { args.append("--advise") }
         if rehearseEnabled { args.append("--rehearse") }
         if speakEnabled { args.append("--speak") }
-        // 克隆声线只在有发言方向时有意义；凭据在选择时已校验过，
-        // Python 侧仍有 fail-closed 兜底。
+        // 「我的声音」= cascade 级联引擎（2026-07-31 真人复验转正）；
+        // 凭据在选择时已校验过，Python 侧仍有 fail-closed 兜底。
         if (rehearseEnabled || speakEnabled) && cloneVoiceEnabled {
-            args.append(contentsOf: ["--speak-engine", "clone"])
+            args.append(contentsOf: ["--speak-engine", "cascade"])
         }
 
         let task = Process()
@@ -867,15 +868,22 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         // 选择时即校验，不等到会议开始才失败：克隆声线需要 ElevenLabs
         // 密钥与声线编号，缺了就给出可照做的一次性配置指引。
         let env = loginEnvironment()
-        let missingKey = (env["ELEVENLABS_API_KEY"] ?? "").isEmpty
-        let missingVoice = (env["ELEVENLABS_VOICE_ID"] ?? "").isEmpty
-        if missingKey || missingVoice {
+        var missing: [String] = []
+        if (env["ELEVENLABS_API_KEY"] ?? "").isEmpty {
+            missing.append("ELEVENLABS_API_KEY（ElevenLabs 密钥）")
+        }
+        if (env["ELEVENLABS_VOICE_ID"] ?? "").isEmpty {
+            missing.append("ELEVENLABS_VOICE_ID（你的声线编号）")
+        }
+        // cascade 的翻译层用 Claude——与参谋/纪要同一把钥匙。
+        if (env["ANTHROPIC_API_KEY"] ?? "").isEmpty {
+            missing.append("ANTHROPIC_API_KEY（翻译所需）")
+        }
+        if !missing.isEmpty {
             alert(
                 "还不能使用「我的声音」",
                 "需要先完成一次性配置：在 ~/.zshenv 中写入 "
-                + (missingKey ? "ELEVENLABS_API_KEY（ElevenLabs 密钥）" : "")
-                + (missingKey && missingVoice ? " 和 " : "")
-                + (missingVoice ? "ELEVENLABS_VOICE_ID（你的声线编号）" : "")
+                + missing.joined(separator: "、")
                 + "，保存后重新打开本 App。"
             )
             return
