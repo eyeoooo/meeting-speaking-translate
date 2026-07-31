@@ -575,7 +575,7 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 后台自举：拷源码 → 选 python3 → 建 venv → pip install。
+    /// 后台自举：拷源码 → 备好解释器（内嵌优先）→ 建 venv → pip install。
     /// 任一步失败都必须给出"一条可复制的修复命令"——新机器上没有维护者在场，
     /// 只弹一句"环境缺失"等于装死。
     private func bootstrapEnvironment() {
@@ -587,7 +587,9 @@ final class GatewayController: NSObject, NSApplicationDelegate {
                 fixCommand: "重新解压 会议助手.zip，把完整的 会议助手.app 拖进应用程序后再打开")
             return
         }
-        guard let python = suitableSystemPython() else {
+        // 解释器来源：① bundle 内嵌 CPython（分发形态，新机零依赖）；
+        // ② 系统/Homebrew python3（开发用构建可能没随附运行时）。
+        guard let python = materializedRuntimePython() ?? suitableSystemPython() else {
             envPrepFailed(
                 "这台电脑缺少 Python 3.10 或更新版本（系统自带的太旧）",
                 fixCommand: "brew install python@3.12")
@@ -636,6 +638,25 @@ final class GatewayController: NSObject, NSApplicationDelegate {
             if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
             try fm.copyItem(at: src, to: dst)
         }
+    }
+
+    /// bundle 自带的 CPython 运行时 → 拷到运行根后返回解释器路径。
+    /// 必须拷出而不是原地使用：venv 会用绝对路径指回解释器，指进 bundle
+    /// 的话 App 一旦移动/重装，已建好的环境就整个失效。
+    /// ditto 保符号链接与权限（FileManager.copyItem 语义不够明确，不赌）。
+    private func materializedRuntimePython() -> String? {
+        let fm = FileManager.default
+        let dst = gatewayRoot.appendingPathComponent("runtime")
+        let dstPython = dst.appendingPathComponent("bin/python3").path
+        if fm.isExecutableFile(atPath: dstPython) { return dstPython }
+        guard let src = Bundle.main.resourceURL?.appendingPathComponent("python"),
+              fm.isExecutableFile(atPath: src.appendingPathComponent("bin/python3").path)
+        else { return nil }
+        setEnvPrepStatus("首次准备环境 · 正在安放 Python 运行时…")
+        guard runBootstrapStep("/usr/bin/ditto", [src.path, dst.path]),
+              fm.isExecutableFile(atPath: dstPython)
+        else { return nil }
+        return dstPython
     }
 
     /// 找一个 ≥3.10 的系统 python3。/usr/bin/python3 到 macOS 26 仍是 3.9，

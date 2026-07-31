@@ -28,6 +28,56 @@ BUILD_STAMP="$(date +%Y%m%d.%H%M)"
 BUILD_DIR="$PWD/build"
 mkdir -p "$DEST" "$BUILD_DIR"
 
+# 内嵌 Python 运行时（astral-sh/python-build-standalone，install_only_stripped）：
+# 新机器首启不再依赖 Homebrew python——App 自带解释器，自举只剩"拷出+建 venv"。
+# pin 确切版本+sha256：构建可重现，供应链可审计；压缩包缓存在 build/（gitignore），
+# 有缓存时断网也能构建。
+PY_RUNTIME_TAG="20260728"
+PY_RUNTIME_VERSION="3.12.13"
+case "$(uname -m)" in
+  arm64)
+    PY_RUNTIME_ARCH="aarch64"
+    PY_RUNTIME_SHA256="2f18cdef4125ca1440dd1ba00ebcb267526efb532138c0860438f755ea4eebac"
+    ;;
+  x86_64)
+    PY_RUNTIME_ARCH="x86_64"
+    PY_RUNTIME_SHA256="e654c21d0ba53e2c671868d4112fac5874deca4c35226d36c5cfe53bc5c9cd71"
+    ;;
+  *)
+    PY_RUNTIME_ARCH=""
+    PY_RUNTIME_SHA256=""
+    ;;
+esac
+
+fetch_python_runtime() {  # stdout=解包后的 python/ 目录；进度走 stderr
+  if [ -z "$PY_RUNTIME_ARCH" ]; then
+    echo "✗ 未知架构 $(uname -m)，无法内嵌 Python 运行时" >&2
+    return 1
+  fi
+  local name="cpython-${PY_RUNTIME_VERSION}+${PY_RUNTIME_TAG}-${PY_RUNTIME_ARCH}-apple-darwin-install_only_stripped.tar.gz"
+  local tarball="$BUILD_DIR/$name"
+  local unpacked="$BUILD_DIR/python-runtime-$PY_RUNTIME_ARCH"
+  if [ ! -x "$unpacked/bin/python3" ]; then
+    if [ ! -f "$tarball" ]; then
+      echo "   ↓ 下载内嵌 Python 运行时 $name" >&2
+      curl -fsSL -o "$tarball.part" \
+        "https://github.com/astral-sh/python-build-standalone/releases/download/${PY_RUNTIME_TAG}/${name}"
+      mv "$tarball.part" "$tarball"
+    fi
+    echo "${PY_RUNTIME_SHA256}  ${tarball}" | shasum -a 256 -c - >/dev/null || {
+      echo "✗ 内嵌运行时 sha256 校验失败（缓存已删，重跑即重新下载）：$name" >&2
+      rm -f "$tarball"
+      return 1
+    }
+    rm -rf "$unpacked" "$unpacked.tmp"
+    mkdir -p "$unpacked.tmp"
+    tar -xzf "$tarball" -C "$unpacked.tmp"
+    mv "$unpacked.tmp/python" "$unpacked"
+    rm -rf "$unpacked.tmp"
+  fi
+  echo "$unpacked"
+}
+
 make_plist() {  # $1=bundle路径 $2=可执行名 $3=bundle id $4=显示名 $5=额外键
   # LSMinimumSystemVersion=14.0：实机是 macOS 26，但代码只用到 macOS 13 API
   # （SMAppService），保守写 14.0 给一代余量而不虚标。
@@ -82,6 +132,12 @@ copy_gateway_payload() {  # $1=bundle路径
   rsync -a --exclude='__pycache__/' --exclude='*.pyc' ../audio_gateway "$res/"
   cp ../requirements.txt "$res/"
   cp ../examples/meeting-brief.example.md "$res/examples/"
+  # 内嵌 CPython 随包走：缺了它，分发包在无 Homebrew 的新机上就是空壳，
+  # 所以取不到运行时=构建失败，绝不静默出一个"看起来能装"的包。
+  local runtime
+  runtime="$(fetch_python_runtime)" || exit 1
+  rm -rf "$1/Contents/Resources/python"
+  ditto "$runtime" "$1/Contents/Resources/python"
 }
 
 build_swift_app() {  # $1=源码(可空格分隔多文件) $2=可执行名 $3=bundle名 $4=bundle id $5=额外plist键 $6=图标变体 $7=payload函数(可选)
@@ -155,7 +211,7 @@ build_dist() {
 系统要求
 --------
 - macOS 14 或更新（Apple Silicon 推荐）
-- Python 3.10+（推荐 Homebrew：brew install python@3.12）
+- 无需安装 Python：App 自带运行时（首次启动自动就位）
 - 网络连接（字幕/建议/纪要调用 OpenAI 与 Anthropic API）
 - 可选：BlackHole 虚拟声卡（本机 Teams/Zoom 模式需要）：
   brew install blackhole-2ch blackhole-16ch
