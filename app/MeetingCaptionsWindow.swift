@@ -13,15 +13,20 @@ import AppKit
 import Foundation
 
 /// 单条泳道：标题 + 只读滚动文本。追加行数封顶，避免长会议无限膨胀。
+/// 末尾可挂一行灰字草稿（未成句的转写中间态）：后一条整体取代前一条，
+/// 空串即清除——与正式行的 append-only 语义互不干扰。
 private final class CaptionLane {
     let container = NSView()
     private let textView: NSTextView
     private let scrollView: NSScrollView
+    private let font: NSFont
     private let maxLines: Int
     private var lines: [String] = []
+    private var draft = ""
 
     init(title: String, fontSize: CGFloat, maxLines: Int = 120) {
         self.maxLines = maxLines
+        self.font = .systemFont(ofSize: fontSize)
 
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 11, weight: .semibold)
@@ -51,21 +56,45 @@ private final class CaptionLane {
     }
 
     func append(_ line: String) {
-        // 只有用户本来就贴着底部时才自动跟随——往回翻旧字幕时绝不抢滚动条
-        let atBottom = isPinnedToBottom()
         lines.append(line)
         if lines.count > maxLines {
             lines.removeFirst(lines.count - maxLines)
         }
-        textView.string = lines.joined(separator: "\n")
-        if atBottom {
-            textView.scrollToEndOfDocument(nil)
-        }
+        render()
+    }
+
+    func setDraft(_ text: String) {
+        guard draft != text else { return }
+        draft = text
+        render()
     }
 
     func reset() {
         lines = []
+        draft = ""
         textView.string = ""
+    }
+
+    private func render() {
+        // 只有用户本来就贴着底部时才自动跟随——往回翻旧字幕时绝不抢滚动条
+        let atBottom = isPinnedToBottom()
+        let body = NSMutableAttributedString(
+            string: lines.joined(separator: "\n"),
+            attributes: [.font: font, .foregroundColor: NSColor.labelColor]
+        )
+        if !draft.isEmpty {
+            body.append(NSAttributedString(
+                string: (body.length == 0 ? "" : "\n") + draft,
+                attributes: [
+                    .font: font,
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+            ))
+        }
+        textView.textStorage?.setAttributedString(body)
+        if atBottom {
+            textView.scrollToEndOfDocument(nil)
+        }
     }
 
     private func isPinnedToBottom() -> Bool {
@@ -180,6 +209,9 @@ final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegat
         wantConnected = false
         socketTask?.cancel(with: .normalClosure, reason: nil)
         socketTask = nil
+        // 会议结束后灰字草稿已无后续，留着会像"卡住了"；正式行原样保留。
+        zhLane.setDraft("")
+        jaLane.setDraft("")
         setStatus("会议已结束 · 字幕停止更新")
     }
 
@@ -265,6 +297,9 @@ final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegat
         case "segment":
             reconnectDelay = 3
             applySegment(json)
+        case "segment_draft":
+            reconnectDelay = 3
+            applyDraft(json)
         case "rehearsal_segment":
             reconnectDelay = 3
             applyRehearsalSegment(json)
@@ -295,6 +330,18 @@ final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegat
             zhLane.append(line)
         } else if stream == "source" {
             jaLane.append(line)
+        }
+    }
+
+    private func applyDraft(_ record: [String: Any]) {
+        // 草稿无 id 不去重：同泳道后一条整体取代前一条，空串清除灰字。
+        guard let stream = record["stream"] as? String,
+              let text = record["text"] as? String
+        else { return }
+        if stream == "translation" {
+            zhLane.setDraft(text)
+        } else if stream == "source" {
+            jaLane.setDraft(text)
         }
     }
 

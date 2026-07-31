@@ -31,6 +31,7 @@ from audio_gateway.bridge import (  # noqa: E402
     BridgeRuntimeState,
     SegmentHistory,
     _history,
+    draft_broadcast_payload,
     _interpret_voice,
     _route_sentence_to_advisor,
 )
@@ -154,6 +155,21 @@ class HistoryTests(unittest.TestCase):
             "markdown": "建议: 保持观望",
             "t": 456.0,
         }, advice_message)
+        # 草稿是独立消息类型：无 id（不 append-only、后条取代前条）、无
+        # t/elapsed_ms（可变中间态没有可信时间戳）；空串=清除灰字也是合法值。
+        self.assertEqual({
+            "type": "segment_draft",
+            "stream": "source",
+            "text": "皆さん",
+            "epoch": 1,
+        }, draft_broadcast_payload("source", "皆さん", 1))
+        self.assertEqual(
+            {"type": "segment_draft", "stream": "translation", "text": "",
+             "epoch": 0},
+            draft_broadcast_payload("translation", "", 0),
+        )
+        with self.assertRaises(ValueError):
+            draft_broadcast_payload("mystery", "文本", 0)
 
 
 class HistoryEndpointTests(unittest.IsolatedAsyncioTestCase):

@@ -42,6 +42,8 @@
   .seg-ja { color:#8b949e; font-size:12px; line-height:1.5; white-space:pre-wrap;
             padding:4px 2px; border-bottom:1px solid #21262d; }
   .seg-zh:last-child, .seg-ja:last-child { border-bottom:0; }
+  /* 未成句的转写草稿：灰字挂在泳道末尾，正式段发布后被取代 */
+  .seg-draft { color:#6e7681; font-weight:400; border-bottom:0; }
   .stream-foot { display:flex; justify-content:space-between; align-items:center; margin-top:7px;
                  color:#6e7681; font-size:11px; }
   #btnFollow { padding:4px 9px; margin:0; font-size:11px; background:#30363d; color:#dbe4ee; }
@@ -116,6 +118,8 @@ let serverMuted = false, micOk = false, wantConnected = false, retryTimer = null
 let serverVoice = false, voicePending = false, followLatest = true;
 // 双泳道各自 60 上限（与服务端 SegmentHistory 一致）；主键是服务端全局单调 id。
 let sourceSegments = [], zhSegments = [], advice = [];
+// 灰字草稿：每泳道一条可变中间态，后一条整体取代前一条，空串即清除
+const drafts = { source: "", translation: "" };
 let lastBridgeState = null;
 let upFrames = 0, lastUpFrames = 0;
 
@@ -196,14 +200,14 @@ function fmtClock(seg) {
   const total = Math.max(0, Math.floor(seconds));
   return `[${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}]`;
 }
-function renderLane(lane, title, items, rowClass) {
+function renderLane(lane, title, items, rowClass, draft) {
   const previousBottomDistance = lane.scrollHeight - lane.scrollTop;
   lane.replaceChildren();
   const head = document.createElement("div");
   head.className = "lane-title";
   head.textContent = title;
   lane.append(head);
-  if (!items.length) {
+  if (!items.length && !draft) {
     const waiting = document.createElement("div");
     waiting.className = "sentence-source";
     waiting.textContent = "等待字幕…";
@@ -218,6 +222,12 @@ function renderLane(lane, title, items, rowClass) {
       row.append(time, document.createTextNode(seg.text));
       lane.append(row);
     }
+    if (draft) {
+      const row = document.createElement("div");
+      row.className = `${rowClass} seg-draft`;
+      row.textContent = draft;
+      lane.append(row);
+    }
   }
   if (followLatest) {
     lane.scrollTop = lane.scrollHeight;
@@ -226,8 +236,8 @@ function renderLane(lane, title, items, rowClass) {
   }
 }
 function renderSegments() {
-  renderLane($("laneZh"), "中文译文 · 同传延迟约 1-3 秒，与日文行不逐句对应", zhSegments, "seg-zh");
-  renderLane($("laneJa"), "日文原文", sourceSegments, "seg-ja");
+  renderLane($("laneZh"), "中文译文 · 同传延迟约 1-3 秒，与日文行不逐句对应", zhSegments, "seg-zh", drafts.translation);
+  renderLane($("laneJa"), "日文原文", sourceSegments, "seg-ja", drafts.source);
   renderFollowState();
 }
 function renderAdvice(state) {
@@ -289,6 +299,12 @@ function applySegment(item) {
   };
   if (item.stream === "translation") zhSegments = upsertById(zhSegments, seg, 60);
   else sourceSegments = upsertById(sourceSegments, seg, 60);
+  renderSegments();
+}
+function applyDraft(item) {
+  if (item.stream !== "source" && item.stream !== "translation") return;
+  if (typeof item.text !== "string") return;
+  drafts[item.stream] = item.text;
   renderSegments();
 }
 function applyAdvice(item) {
@@ -366,6 +382,10 @@ async function connect() {
       const st = JSON.parse(e.data);
       if (st.type === "segment") {
         applySegment(st);
+        return;
+      }
+      if (st.type === "segment_draft") {
+        applyDraft(st);
         return;
       }
       if (st.type === "advice") {

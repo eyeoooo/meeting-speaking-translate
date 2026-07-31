@@ -79,6 +79,9 @@ class Segment:
 
 StateCallback = Callable[[dict[str, Any]], None]
 SentenceCallback = Callable[[Segment], None]
+# 草稿回调 (stream, text, epoch)：text 是当前未成句的半句，空串表示该泳道
+# 草稿已被正式段收编。草稿是可变中间态，与 append-only 的 Segment 分开走。
+DraftCallback = Callable[[str, str, int], None]
 ErrorCallback = Callable[[str], None]
 SleepCallback = Callable[[float], Awaitable[None]]
 SessionFactory = Callable[[], Any]
@@ -269,6 +272,11 @@ class SentenceAccumulator:
         sentence = self._pending.strip()
         self._pending = ""
         return [sentence] if sentence else []
+
+    @property
+    def pending(self) -> str:
+        """当前未成句的半句——字幕草稿行的数据源，只读。"""
+        return self._pending
 
 
 class InterpreterState:
@@ -498,6 +506,7 @@ class RealtimeInterpreter:
         state: InterpreterState | None = None,
         on_state: StateCallback | None = None,
         on_sentence: SentenceCallback | None = None,
+        on_draft: DraftCallback | None = None,
         on_error: ErrorCallback | None = None,
         sleep: SleepCallback = asyncio.sleep,
         close_timeout: float = 5.0,
@@ -523,6 +532,7 @@ class RealtimeInterpreter:
         )
         self._on_state = on_state
         self._on_sentence = on_sentence
+        self._on_draft = on_draft
         self._on_error = on_error
         self._sleep = sleep
         self._close_timeout = close_timeout
@@ -537,6 +547,8 @@ class RealtimeInterpreter:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._source_text = SentenceAccumulator()
         self._translation_text = SentenceAccumulator()
+        # 每泳道上一次发出的草稿，内容不变不重发（尤其是清空后的连续空串）。
+        self._last_draft = {"source": "", "translation": ""}
         # 每断线重连递增；随每条 Segment 带出，是双泳道协议的 session 边界。
         self._epoch = 0
         self._vad = SilenceVadGate(
@@ -914,6 +926,17 @@ class RealtimeInterpreter:
         )
         for sentence in accumulator.feed(delta):
             self._publish_segment(kind, sentence, marker)
+        # 正式句发布之后再发草稿：客户端按到达序应用，灰字永远是"这句话
+        # 之后还没说完的部分"。成句被收编时 pending 变短/清空，同样走这里。
+        self._emit_draft(kind, accumulator.pending)
+
+    def _emit_draft(self, kind: str, text: str) -> None:
+        stripped = text.strip()
+        if self._last_draft.get(kind) == stripped:
+            return
+        self._last_draft[kind] = stripped
+        if self._on_draft is not None:
+            self._on_draft(kind, stripped, self._epoch)
 
     def _flush_text(self) -> None:
         # 断线冲刷的残句属于已结束的 session，没有可信的 elapsed_ms。
@@ -921,6 +944,9 @@ class RealtimeInterpreter:
             self._publish_segment("source", sentence, None)
         for sentence in self._translation_text.flush():
             self._publish_segment("translation", sentence, None)
+        # 残句已作为正式段发出，清掉两条泳道的灰字草稿。
+        self._emit_draft("source", "")
+        self._emit_draft("translation", "")
         # 每次连接结束递增 epoch：重连即全新 session（服务端时钟归零、
         # 断句状态清空），任何跨 session 的配对想象在这里被硬性切断。
         self._epoch += 1

@@ -63,6 +63,15 @@ SEGMENT_RECORD_FIELDS = frozenset(
     {"id", "stream", "text", "t", "elapsed_ms", "epoch"}
 )
 
+# 草稿行脚本：句中 delta 造出未成句的 pending（灰字草稿的数据源）；
+# 译文一次整句到达（pending 始终空）作对照，断线验证残句冲刷后草稿清空。
+DRAFT_SCRIPT = """
+{"conn": 1, "type": "session.input_transcript.delta", "delta": "皆さん", "elapsed_ms": 100}
+{"conn": 1, "type": "session.input_transcript.delta", "delta": "こんにちは。次の", "elapsed_ms": 200}
+{"conn": 1, "type": "session.output_transcript.delta", "delta": "大家好。", "elapsed_ms": 300}
+{"conn": 1, "close": true}
+"""
+
 
 async def collect_segments(script: str, expected: int) -> list[Segment]:
     """Drive RealtimeInterpreter over an NDJSON script and collect Segments."""
@@ -93,6 +102,42 @@ async def collect_segments(script: str, expected: int) -> list[Segment]:
     await client.stop()
     await task
     return segments
+
+
+async def collect_segments_and_drafts(
+    script: str,
+    expected_drafts: int,
+) -> tuple[list[Segment], list[tuple[str, str, int]]]:
+    """Drive RealtimeInterpreter and collect both segments and draft events."""
+    server = MockRealtimeServer(script=script)
+    segments: list[Segment] = []
+    drafts: list[tuple[str, str, int]] = []
+    enough = asyncio.Event()
+
+    def on_draft(stream: str, text: str, epoch: int) -> None:
+        drafts.append((stream, text, epoch))
+        if len(drafts) >= expected_drafts:
+            enough.set()
+
+    async def fast_sleep(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    client = RealtimeInterpreter(
+        Tap("interpreter", maxsize=8, drop_oldest=True),
+        SpyOutputPlayer(),
+        api_key="mock-key-never-sent-to-openai",
+        safety_identifier="hashed-test-user",
+        url=server.url,
+        sleep=fast_sleep,
+        on_sentence=segments.append,
+        on_draft=on_draft,
+        session_factory=server.session_factory,
+    )
+    task = client.start()
+    await asyncio.wait_for(enough.wait(), 2.0)
+    await client.stop()
+    await task
+    return segments, drafts
 
 
 def fill_history(segments: list[Segment]) -> SegmentHistory:
@@ -312,6 +357,51 @@ class SentenceAccumulatorSpecTests(unittest.TestCase):
         self.assertEqual([], accumulator.feed("途中まで"))
         now["value"] = 6.0
         self.assertEqual(["途中まで、"], accumulator.feed("、"))
+
+
+class CaptionDraftSpecTests(unittest.IsolatedAsyncioTestCase):
+    """字幕草稿行规格：草稿=pending 的镜像，是可变中间态，不是第三条流。
+
+    草稿永远不进 SegmentHistory / 参谋 / 落盘——它没有 id、没有 append-only
+    保证，后一条整体取代前一条，空串表示已被正式段收编。
+    """
+
+    def test_pending_property_exposes_unfinished_sentence(self) -> None:
+        accumulator = SentenceAccumulator()
+
+        self.assertEqual("", accumulator.pending)
+        accumulator.feed("皆さん")
+        self.assertEqual("皆さん", accumulator.pending)
+        # 成句收编后 pending 只剩句尾残余
+        accumulator.feed("こんにちは。次の")
+        self.assertEqual("次の", accumulator.pending)
+        accumulator.flush()
+        self.assertEqual("", accumulator.pending)
+
+    async def test_draft_mirrors_pending_and_clears_after_publish(self) -> None:
+        segments, drafts = await collect_segments_and_drafts(DRAFT_SCRIPT, 3)
+
+        # 半句出现→草稿更新；成句收编→草稿变为句尾残余；断线残句冲刷成
+        # 正式段后→空串清除灰字。译文整句到达（pending 始终空）则一条
+        # 草稿都不发——内容不变不重发。
+        self.assertEqual(
+            [
+                ("source", "皆さん", 0),
+                ("source", "次の", 0),
+                ("source", "", 0),
+            ],
+            drafts,
+        )
+        # 草稿不产生 Segment：正式段仍只有成句与断线冲刷的残句，且顺序
+        # 在草稿清空事件之前就已发布（客户端按到达序应用天然一致）。
+        self.assertEqual(
+            [
+                ("source", "皆さんこんにちは。"),
+                ("translation", "大家好。"),
+                ("source", "次の"),
+            ],
+            [(s.stream, s.text) for s in segments],
+        )
 
 
 class ArchiveSchemaTests(unittest.TestCase):

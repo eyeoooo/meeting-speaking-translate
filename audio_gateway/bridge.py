@@ -189,6 +189,23 @@ class SegmentHistory:
         return merged
 
 
+def draft_broadcast_payload(stream: str, text: str, epoch: int) -> dict[str, Any]:
+    """字幕草稿（未成句的灰字中间态）的 WS 消息，与 segment 是两种东西。
+
+    草稿是可变态——同一泳道后一条永远整体取代前一条，空串表示草稿已被
+    正式段收编。因此它绝不进 append-only 的 SegmentHistory，也不进
+    /history、不进参谋、不落盘；断线错过就错过，正式段才是事实记录。
+    """
+    if stream not in ("source", "translation"):
+        raise ValueError(f"unknown draft stream: {stream}")
+    return {
+        "type": "segment_draft",
+        "stream": stream,
+        "text": text,
+        "epoch": int(epoch),
+    }
+
+
 class AdviceHistory:
     """Thread-safe bounded advice history; records keep WS message shape."""
 
@@ -1412,6 +1429,14 @@ def run_bridge(
                 ),
             )
 
+    def on_interpreter_draft(stream: str, text: str, epoch: int) -> None:
+        # 草稿只走 WS 直发（见 draft_broadcast_payload 的产品边界）。
+        schedule(
+            _broadcast_json,
+            app,
+            draft_broadcast_payload(stream, text, epoch),
+        )
+
     def on_interpreter_state(snapshot: dict) -> None:
         error = snapshot.get("error")
         runtime_state.set_component_alert(
@@ -1434,6 +1459,7 @@ def run_bridge(
             state=interpreter_state,
             on_state=on_interpreter_state,
             on_sentence=on_interpreter_segment,
+            on_draft=on_interpreter_draft,
             vad_dbfs=interpret_vad_dbfs,
         )
         app["interpreter"] = interpreter
