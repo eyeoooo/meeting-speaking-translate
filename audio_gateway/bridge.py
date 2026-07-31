@@ -1609,8 +1609,23 @@ def run_bridge(
                     )
                 )
                 print(f"[bridge] {own_note}", flush=True)
+            # clone/cascade 的音频是 ElevenLabs 整句突发（几乎一次到齐），
+            # 用 150ms 预缓冲换回 0.25s 首音延迟；translate/expressive 是
+            # OpenAI 实时细流，保持 400ms 抖动保护。
+            from .interpreter import (
+                BURST_PREBUFFER_SECONDS,
+                PLAYBACK_PREBUFFER_SECONDS,
+            )
+
+            speak_prebuffer = (
+                BURST_PREBUFFER_SECONDS
+                if speak_engine in {"clone", "cascade"}
+                else PLAYBACK_PREBUFFER_SECONDS
+            )
             own_player = (
-                InterpreterOutputPlayer(own_device)
+                InterpreterOutputPlayer(
+                    own_device, prebuffer_seconds=speak_prebuffer
+                )
                 if own_device >= 0
                 else None
             )
@@ -1623,7 +1638,9 @@ def run_bridge(
                 meeting_out = (
                     speak_device if speak_device is not None else dev.mac_out
                 )
-                meeting_player = InterpreterOutputPlayer(meeting_out)
+                meeting_player = InterpreterOutputPlayer(
+                    meeting_out, prebuffer_seconds=speak_prebuffer
+                )
                 player = SpeakTeePlayer(
                     meeting=meeting_player,
                     own=own_player,

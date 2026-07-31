@@ -430,6 +430,79 @@ class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class CascadeStreamingTranslatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_sentence_reaches_tts_before_stream_ends(
+        self,
+    ) -> None:
+        # 延迟优化第二刀：译文首句成句即送 TTS，不等整段生成完。
+        # 用事件门控的流式假翻译器证明：第二句还没生成时第一句已出声。
+        release = asyncio.Event()
+        calls: list = []
+
+        def factory(api_key, model, system_text):
+            async def translate(text, context):
+                calls.append(text)
+                yield "一文目です。"
+                await release.wait()
+                yield "二文目です。"
+
+            return translate
+
+        events = [
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "两句话的发言",
+            },
+        ]
+        server = MockRealtimeServer(_transcription_script(events))
+        tts = _FakeTtsSession([
+            _FakeTtsResponse(chunks=(CLONE_PCM,)),
+            _FakeTtsResponse(chunks=(CLONE_PCM,)),
+        ])
+        output = SpyOutputPlayer()
+        state = InterpreterState(
+            enabled=True,
+            lang="ja",
+            interpret_voice=True,
+        )
+        segments: list = []
+        client = CascadeSpeechSession(
+            Tap("rehearsal", maxsize=8, drop_oldest=True),
+            output,
+            api_key="mock-key-never-sent-to-openai",
+            anthropic_api_key="ant-mock-key",
+            elevenlabs_api_key="el-mock-key",
+            voice_id="voice-clone-1",
+            safety_identifier="hashed-test-user",
+            url=server.url,
+            state=state,
+            on_sentence=segments.append,
+            session_factory=server.session_factory,
+            translator_factory=factory,
+            tts_session_factory=lambda: tts,
+        )
+
+        task = client.start()
+        # 首句在流未结束时就已进入 TTS——这就是省下的尾部生成时间。
+        await _wait_until(lambda: len(tts.requests) >= 1)
+        self.assertEqual(
+            "一文目です。", tts.requests[0]["json"]["text"]
+        )
+        self.assertFalse(release.is_set())
+        release.set()
+        await _wait_until(lambda: len(tts.requests) >= 2)
+        self.assertEqual(
+            "二文目です。", tts.requests[1]["json"]["text"]
+        )
+        await client.stop()
+        await task
+
+        # 全文进入滚动上下文（供下一句指代）。
+        self.assertEqual(["两句话的发言"], calls)
+
+
 class CascadeEchoGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_recent_speech_is_dropped_as_self_echo(self) -> None:
         # 真人复验实锤：耳机漏音把系统自己的日语采回麦克风，
@@ -440,6 +513,9 @@ class CascadeEchoGuardTests(unittest.IsolatedAsyncioTestCase):
         client, output, _ = self._make(server, tts)
 
         task = client.start()
+        # 等播放器就绪再发布：语音门控在播放器启动前会丢弃合成请求，
+        # 慢机器上这里存在真实竞态（MACMINI 实测）。
+        await _wait_until(lambda: client._player_started)
         # 系统说出一句译文（进入比对集）
         client._publish_segment(
             "translation", "それでは、見積もりについてご説明します。", None

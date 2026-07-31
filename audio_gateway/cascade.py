@@ -217,8 +217,10 @@ def _default_translator(
     async def translate(
         text: str,
         context: list[tuple[str, str]],
-    ) -> str:
-        response = await client.messages.create(
+    ):
+        # 流式输出：worker 把 delta 直灌断句器，首句成句即送 TTS，
+        # 不等整段生成完——多句译文时省掉整个尾部生成时间。
+        async with client.messages.stream(
             model=model,
             max_tokens=400,
             system=system,
@@ -226,12 +228,9 @@ def _default_translator(
                 "role": "user",
                 "content": build_translation_user(context, text),
             }],
-        )
-        return "".join(
-            block.text
-            for block in response.content
-            if getattr(block, "type", "") == "text"
-        )
+        ) as stream:
+            async for delta in stream.text_stream:
+                yield delta
 
     return translate
 
@@ -412,6 +411,21 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                 name="cascade-translate",
             )
 
+    async def _consume_translation_stream(self, stream: Any) -> str:
+        """把译文 delta 直灌断句器（首句成句即送 TTS），返回全文。"""
+        parts: list[str] = []
+        async for delta in stream:
+            if not isinstance(delta, str) or not delta:
+                continue
+            # 出口谚文防火墙（流式版）：异常字符立即中止本句。
+            if _HANGUL_RE.search(delta):
+                raise RuntimeError("译文出现异常字符（谚文）")
+            parts.append(delta)
+            self._consume_text_delta("translation", delta, None)
+        # 换行冲刷无终止符的尾巴（既有断句语义）。
+        self._consume_text_delta("translation", "\n", None)
+        return "".join(parts).strip()
+
     async def _translator_worker(self) -> None:
         # 单工作者串行翻译：句序即播放序；上下文追加也因此无竞态。
         while True:
@@ -421,8 +435,19 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                 self._consume_text_delta("translation", text + "\n", None)
                 continue
             try:
+                result = self._translate(text, list(self._context))
+                if hasattr(result, "__aiter__"):
+                    # 流式翻译器：delta 边到边发布（测试用假翻译器
+                    # 仍可返回协程整句，两种契约并存）。
+                    translated = await asyncio.wait_for(
+                        self._consume_translation_stream(result),
+                        TRANSLATE_TIMEOUT_SECONDS,
+                    )
+                    if translated:
+                        self._context.append((text, translated))
+                    continue
                 translated = await asyncio.wait_for(
-                    self._translate(text, list(self._context)),
+                    result,
                     TRANSLATE_TIMEOUT_SECONDS,
                 )
             except asyncio.CancelledError:

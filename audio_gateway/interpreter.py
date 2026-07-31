@@ -40,7 +40,14 @@ OUTPUT_SAMPLE_RATE = 48_000
 # 译文语音抖动预缓冲：400ms。真实 Teams 验收（2026-07-30）实测 TTS 增量
 # 经网络到达不均匀，零缓冲直出句中出现空洞；400ms 换句内连贯，
 # 首音延迟增加同额，仍远小于句级延迟预算。
-PLAYBACK_PREBUFFER_SAMPLES = int(OUTPUT_SAMPLE_RATE * 0.4)
+PLAYBACK_PREBUFFER_SECONDS = 0.4
+PLAYBACK_PREBUFFER_SAMPLES = int(
+    OUTPUT_SAMPLE_RATE * PLAYBACK_PREBUFFER_SECONDS
+)
+# 突发型语音源（ElevenLabs 整句 PCM 几乎一次到齐）的预缓冲：抖动风险
+# 远低于实时细流（OpenAI TTS delta 逐段到达），150ms 足够吸收调度毛刺。
+# clone/cascade 发言路径用它换回 0.25s 首音延迟（2026-07-31 延迟优化）。
+BURST_PREBUFFER_SECONDS = 0.15
 MIN_APPEND_MILLISECONDS = 100
 MIN_APPEND_INPUT_SAMPLES = (
     INPUT_SAMPLE_RATE * MIN_APPEND_MILLISECONDS // 1_000
@@ -375,6 +382,7 @@ class InterpreterOutputPlayer:
         on_status: Callable[[str], None] | None = None,
         on_error: ErrorCallback | None = None,
         sounddevice_module: Any | None = None,
+        prebuffer_seconds: float = PLAYBACK_PREBUFFER_SECONDS,
     ) -> None:
         self._device = device
         self._on_status = on_status
@@ -384,7 +392,7 @@ class InterpreterOutputPlayer:
         self._sd = sounddevice_module or sd
         self._ring = RingBuffer(
             PLAYBACK_BACKLOG_SAMPLES,
-            prebuffer_samples=PLAYBACK_PREBUFFER_SAMPLES,
+            prebuffer_samples=int(OUTPUT_SAMPLE_RATE * prebuffer_seconds),
         )
         self._stream: Any | None = None
         self._stopping = False
