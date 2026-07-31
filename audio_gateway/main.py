@@ -507,6 +507,29 @@ def cmd_bridge(args) -> int:
                 "以复用同一监听设备。"
             )
             return 2
+    elevenlabs_api_key = ""
+    clone_voice_id = ""
+    if getattr(args, "speak_engine", "translate") == "clone":
+        elevenlabs_api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+        if not elevenlabs_api_key:
+            print(
+                "[bridge] --speak-engine clone 启动已 fail-closed：未设置 "
+                "ELEVENLABS_API_KEY。请先在 Mac mini 的 ~/.zshenv 写入 "
+                "`export ELEVENLABS_API_KEY=...` 后重试。"
+            )
+            return 2
+        clone_voice_id = (
+            getattr(args, "speak_voice_id", "").strip()
+            or os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+        )
+        if not clone_voice_id:
+            print(
+                "[bridge] --speak-engine clone 启动已 fail-closed：未指定"
+                "克隆声线。请传 --speak-voice-id，或在 ~/.zshenv 写入 "
+                "`export ELEVENLABS_VOICE_ID=...`（在 ElevenLabs 完成"
+                "声音克隆后可获得 voice id）。"
+            )
+            return 2
     anthropic_api_key = ""
     if args.advise:
         anthropic_api_key = os.environ.get(
@@ -589,7 +612,9 @@ def cmd_bridge(args) -> int:
                       rehearse_replay=getattr(args, "rehearse_replay", None),
                       speak=getattr(args, "speak", False),
                       speak_device=speak_device,
-                      speak_engine=getattr(args, "speak_engine", "translate"))
+                      speak_engine=getattr(args, "speak_engine", "translate"),
+                      elevenlabs_api_key=elevenlabs_api_key,
+                      clone_voice_id=clone_voice_id)
 
 
 def cmd_micagent(args) -> int:
@@ -705,10 +730,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument(
         "--speak-engine",
-        choices=["translate", "expressive"],
+        choices=["translate", "expressive", "clone"],
         default="translate",
         help="发言引擎：translate=translations 端点（默认，正确性优先）；"
-        "expressive=通用 Realtime GA + marin 声线（A/B 评测中的表现力候选）",
+        "expressive=通用 Realtime GA + marin 声线（A/B 评测中的表现力候选）；"
+        "clone=translate 文本链路 + ElevenLabs 克隆声线（M3，"
+        "需 ELEVENLABS_API_KEY 与 --speak-voice-id）",
+    )
+    b.add_argument(
+        "--speak-voice-id",
+        default="",
+        help="clone 引擎的 ElevenLabs voice id（默认读环境变量 "
+        "ELEVENLABS_VOICE_ID）",
     )
     b.add_argument(
         "--no-postprocess",

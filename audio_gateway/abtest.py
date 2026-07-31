@@ -1,8 +1,10 @@
 """发言引擎 A/B 评测驱动（工程用，产品不暴露、不进菜单）。
 
-用同一段中文语料（--rehearse-replay）分别驱动 translate / expressive 两个
-发言引擎各跑一场真实 bridge（真实 WebSocket、真实模型、真实语音输出到
---speak-device），收集每场的 rehearsal.jsonl 文本段与会话目录：
+用同一段中文语料（--rehearse-replay）分别驱动 translate / expressive /
+clone 发言引擎各跑一场真实 bridge（真实 WebSocket、真实模型、真实语音
+输出到 --speak-device），收集每场的 rehearsal.jsonl 文本段与会话目录
+（clone 引擎需要 ELEVENLABS_API_KEY 与 ELEVENLABS_VOICE_ID 环境变量，
+子进程原样继承）：
 
   - 正确性评测：两场的 translation 段与中文原文逐句对照（人工三档：
     忠实/漏译/加戏；"加戏"=无中生有或把发言当提问来回答，一票红旗）。
@@ -25,7 +27,7 @@ import wave
 from datetime import datetime
 from pathlib import Path
 
-ENGINES = ("translate", "expressive")
+ENGINES = ("translate", "expressive", "clone")
 
 
 def wav_duration_seconds(path: Path) -> float:
@@ -140,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--engines",
         default=",".join(ENGINES),
-        help="逗号分隔，默认 translate,expressive",
+        help="逗号分隔，默认全部引擎（clone 需 ELEVENLABS_* 环境变量）",
     )
     parser.add_argument(
         "--output",

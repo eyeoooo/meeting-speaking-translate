@@ -1173,14 +1173,20 @@ def run_bridge(
     speak: bool = False,
     speak_device: int | None = None,
     speak_engine: str = "translate",
+    elevenlabs_api_key: str = "",
+    clone_voice_id: str = "",
 ) -> int:
     # 发言引擎白名单在一切资源分配之前判定：错误引擎名是配置事故，
     # 绝不能静默回退到任何一个引擎（回退=用户以为在 A/B 其实在 A/A）。
-    if speak_engine not in {"translate", "expressive"}:
+    if speak_engine not in {"translate", "expressive", "clone"}:
         raise ValueError(
             f"unknown speak engine: {speak_engine!r} "
-            "(expected 'translate' or 'expressive')"
+            "(expected 'translate', 'expressive' or 'clone')"
         )
+    if speak_engine == "clone" and not elevenlabs_api_key.strip():
+        raise ValueError("clone speak engine requires ELEVENLABS_API_KEY")
+    if speak_engine == "clone" and not clone_voice_id.strip():
+        raise ValueError("clone speak engine requires a voice id")
     if interpret and not openai_api_key.strip():
         raise ValueError("interpret requires OPENAI_API_KEY")
     if interpret and interpret_device is None:
@@ -1622,6 +1628,25 @@ def run_bridge(
                     player,
                     api_key=openai_api_key,
                     lang="ja",
+                    state=rehearsal_state,
+                    on_state=on_rehearsal_state,
+                    on_sentence=on_rehearsal_segment,
+                    vad_dbfs=interpret_vad_dbfs,
+                )
+            elif speak_engine == "clone":
+                # M3 声纹克隆：文本链路与 translate 引擎逐字相同
+                # （translations 端点 + interpret_model），只把音频出口
+                # 换成 ElevenLabs 克隆声线（详见 voiceclone.py 模块头）。
+                from .voiceclone import CloneSpeechSession
+
+                rehearsal = CloneSpeechSession(
+                    rehearsal_tap,
+                    player,
+                    api_key=openai_api_key,
+                    elevenlabs_api_key=elevenlabs_api_key,
+                    voice_id=clone_voice_id,
+                    lang="ja",
+                    model=interpret_model,
                     state=rehearsal_state,
                     on_state=on_rehearsal_state,
                     on_sentence=on_rehearsal_segment,
