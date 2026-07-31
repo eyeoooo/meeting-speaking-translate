@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PortAudio (sounddevice runtime dependency)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  swift-typecheck:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strict typecheck (warnings as errors)
+        run: |
+          cd app
+          swiftc -warnings-as-errors -parse-as-library -typecheck \
+            GatewayMenuBar.swift MeetingCaptionsWindow.swift
