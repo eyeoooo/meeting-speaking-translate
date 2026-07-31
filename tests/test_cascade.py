@@ -104,8 +104,11 @@ class CascadeConstructionTests(unittest.TestCase):
     def test_translation_prompt_carries_rules_and_glossary(self) -> None:
         system = build_translation_system("KVM=ケーブーエム")
         self.assertIn("逐位", system)
-        self.assertIn("只输出日语译文", system)
+        self.assertIn("只输出日语文本", system)
         self.assertIn("KVM=ケーブーエム", system)
+        # 出口恒为日语、日语入口直通不回译——用户既说中文也说日语。
+        self.assertIn("输出永远是日语", system)
+        self.assertIn("原文已是日语", system)
         user = build_translation_user(
             [("你好。", "こんにちは。")], "第七批设备"
         )
@@ -173,9 +176,12 @@ class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("output", session["audio"])
         transcription = session["audio"]["input"]["transcription"]
         self.assertEqual("gpt-4o-transcribe", transcription["model"])
-        self.assertEqual("zh", transcription["language"])
-        # 热词注入口：数字纪律 + 术语表。
+        # 入口语言自由：绝不钉 language（钉 zh 曾把用户的日语发言
+        # 按中文硬转成乱码），倾向只靠 prompt 引导。
+        self.assertNotIn("language", transcription)
+        # 热词注入口：数字纪律 + 多语言引导 + 术语表。
         self.assertIn("阿拉伯数字", transcription["prompt"])
+        self.assertIn("日语或英语", transcription["prompt"])
         self.assertIn("KVM=ケーブーエム", transcription["prompt"])
         self.assertEqual(
             "server_vad",
