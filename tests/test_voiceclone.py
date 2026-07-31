@@ -31,6 +31,7 @@ from audio_gateway.interpreter import InterpreterState  # noqa: E402
 from audio_gateway.voiceclone import (  # noqa: E402
     CLONE_OUTPUT_FORMAT,
     DEFAULT_CLONE_MODEL,
+    DEFAULT_CLONE_SPEED,
     CloneSpeechSession,
 )
 from test_interpreter import (  # noqa: E402
@@ -237,8 +238,12 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
                 DEFAULT_CLONE_MODEL,
                 request["json"]["model_id"],
             )
-            # 未指定语速时绝不发 voice_settings：用声线自带默认语速。
-            self.assertNotIn("voice_settings", request["json"])
+            # 2026-07-31 用户听感裁决钉成默认：turbo_v2_5 + speed 1.1。
+            self.assertEqual("eleven_turbo_v2_5", DEFAULT_CLONE_MODEL)
+            self.assertEqual(
+                {"speed": DEFAULT_CLONE_SPEED},
+                request["json"]["voice_settings"],
+            )
         # 文本链路原样：source/translation 两条流都正常发布。
         self.assertEqual(
             [
@@ -262,7 +267,8 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
         tts = _FakeTtsSession([
             _FakeTtsResponse(chunks=(b"\x01\x02\x03", b"\x04\x05")),
         ])
-        client, output, _ = self._make_client(server, tts)
+        # 顺带钉住：clone_speed=None 表示显式关闭语速覆盖，不发 voice_settings
+        client, output, _ = self._make_client(server, tts, clone_speed=None)
 
         task = client.start()
         await _wait_until(lambda: len(output.chunks) >= 2)
@@ -272,6 +278,7 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([b"\x01\x02", b"\x03\x04"], output.chunks)
         for chunk in output.chunks:
             self.assertEqual(0, len(chunk) % 2)
+        self.assertNotIn("voice_settings", tts.requests[0]["json"])
 
     async def test_model_and_speed_reach_request_body(self) -> None:
         events = [

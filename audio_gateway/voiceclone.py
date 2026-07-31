@@ -24,9 +24,12 @@ import aiohttp
 
 from .interpreter import RealtimeInterpreter
 
-# 跨语言克隆用 multilingual v2：正确性/相似度优先（flash 系为低延迟档，
-# 音色相似度与韵律弱一档，若真实会议嫌慢再评测降档）。
-DEFAULT_CLONE_MODEL = "eleven_multilingual_v2"
+# 2026-07-31 用户听感裁决：turbo_v2_5 + speed 1.1 为默认。
+# multilingual_v2 音色相似度最高但首字节 ~2s，真机复验"反应延迟明显"；
+# turbo_v2_5 暖连接首字节 ~0.5s，相似度损失用户可接受。speed 1.1 补偿
+# PVC 样本朗读偏慢（"语速比较慢"同一裁决）。
+DEFAULT_CLONE_MODEL = "eleven_turbo_v2_5"
+DEFAULT_CLONE_SPEED = 1.1
 # ElevenLabs voice_settings.speed 的合法区间（官方文档 0.7–1.2）；
 # None=不发该字段，用声线自带默认语速。
 CLONE_SPEED_MIN = 0.7
@@ -57,7 +60,7 @@ class CloneSpeechSession(RealtimeInterpreter):
         elevenlabs_api_key: str,
         voice_id: str,
         clone_model: str = DEFAULT_CLONE_MODEL,
-        clone_speed: float | None = None,
+        clone_speed: float | None = DEFAULT_CLONE_SPEED,
         tts_session_factory: Callable[[], Any] | None = None,
         **kwargs: Any,
     ) -> None:

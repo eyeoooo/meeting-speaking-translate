@@ -1639,7 +1639,11 @@ def run_bridge(
                 # M3 声纹克隆：文本链路与 translate 引擎逐字相同
                 # （translations 端点 + interpret_model），只把音频出口
                 # 换成 ElevenLabs 克隆声线（详见 voiceclone.py 模块头）。
-                from .voiceclone import DEFAULT_CLONE_MODEL, CloneSpeechSession
+                from .voiceclone import (
+                    DEFAULT_CLONE_MODEL,
+                    DEFAULT_CLONE_SPEED,
+                    CloneSpeechSession,
+                )
 
                 rehearsal = CloneSpeechSession(
                     rehearsal_tap,
@@ -1648,7 +1652,11 @@ def run_bridge(
                     elevenlabs_api_key=elevenlabs_api_key,
                     voice_id=clone_voice_id,
                     clone_model=clone_model or DEFAULT_CLONE_MODEL,
-                    clone_speed=clone_speed,
+                    clone_speed=(
+                        clone_speed
+                        if clone_speed is not None
+                        else DEFAULT_CLONE_SPEED
+                    ),
                     lang="ja",
                     model=interpret_model,
                     state=rehearsal_state,

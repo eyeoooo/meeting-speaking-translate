@@ -748,14 +748,14 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument(
         "--clone-model",
         default=None,
-        help="clone 引擎的 ElevenLabs 模型（默认 eleven_multilingual_v2；"
-        "低延迟可选 eleven_turbo_v2_5）",
+        help="clone 引擎的 ElevenLabs 模型（默认 eleven_turbo_v2_5，"
+        "用户听感裁决；质量优先可选 eleven_multilingual_v2）",
     )
     b.add_argument(
         "--clone-speed",
         type=float,
         default=None,
-        help="clone 引擎语速（0.7–1.2，默认用声线自带语速）",
+        help="clone 引擎语速（0.7–1.2，默认 1.1）",
     )
     b.add_argument(
         "--no-postprocess",
