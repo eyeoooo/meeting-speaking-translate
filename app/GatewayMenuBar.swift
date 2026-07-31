@@ -79,6 +79,14 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         title: "外部设备（USB 声卡 / 被控机）", action: #selector(useExternalSource), keyEquivalent: "")
     private let rehearseToggle = NSMenuItem(title: "发言排练（只进我的耳机）", action: #selector(toggleRehearse), keyEquivalent: "")
     private let speakToggle = NSMenuItem(title: "正式发言（对方听到日语）", action: #selector(toggleSpeak), keyEquivalent: "")
+    // 发言声音（M3）：标准=端点内置声线（正确性优先默认）；我的声音=
+    // ElevenLabs 克隆（2026-07-31 用户听感验收通过）。expressive 引擎因
+    // 真人复验红线（编造对话轮次）不进产品菜单，仅保留工程 CLI。
+    private let voiceHeader = NSMenuItem(title: "发言声音", action: nil, keyEquivalent: "")
+    private let voiceStandardItem = NSMenuItem(
+        title: "标准声音", action: #selector(useStandardVoice), keyEquivalent: "")
+    private let voiceCloneItem = NSMenuItem(
+        title: "我的声音（克隆）", action: #selector(useCloneVoice), keyEquivalent: "")
     private let settingsHint = NSMenuItem(title: "会议进行中不可更改", action: nil, keyEquivalent: "")
     private let minutesItem = NSMenuItem(title: "打开最近一次纪要", action: #selector(openLatestMinutes), keyEquivalent: "")
     private let muteItem = NSMenuItem(title: "静音发言", action: #selector(toggleMute), keyEquivalent: "m")
@@ -93,6 +101,9 @@ final class GatewayController: NSObject, NSApplicationDelegate {
     private static let rehearseKey = "meeting.rehearseEnabled"
     // 正式发言（M2）：日语进会议。与排练互斥——"对方听没听到"必须无歧义。
     private static let speakKey = "meeting.speakEnabled"
+    // 发言声音：false=标准声音（默认），true=我的声音（ElevenLabs 克隆）。
+    // 持久化：换声音是明确决定，重启 App 不该悄悄换回去。
+    private static let cloneVoiceKey = "meeting.cloneVoiceEnabled"
     // 声音来源：true=本机会议软件（BlackHole 虚拟设备），false=外部 USB 声卡
     private static let localSourceKey = "meeting.localSource"
 
@@ -116,6 +127,10 @@ final class GatewayController: NSObject, NSApplicationDelegate {
     private var speakEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: Self.speakKey) }
         set { UserDefaults.standard.set(newValue, forKey: Self.speakKey) }
+    }
+    private var cloneVoiceEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.cloneVoiceKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.cloneVoiceKey) }
     }
     private var localSource: Bool {
         get { UserDefaults.standard.bool(forKey: Self.localSourceKey) }
@@ -215,6 +230,7 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         alertItem.target = self
         [startItem, soundTestItem, stopItem, cancelItem,
          subtitleToggle, adviceToggle, rehearseToggle, speakToggle,
+         voiceStandardItem, voiceCloneItem,
          sourceLocalItem, sourceExternalItem,
          minutesItem, muteItem].forEach { $0.target = self }
 
@@ -244,6 +260,10 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         menu.addItem(adviceToggle)
         menu.addItem(rehearseToggle)
         menu.addItem(speakToggle)
+        voiceHeader.isEnabled = false
+        menu.addItem(voiceHeader)
+        menu.addItem(voiceStandardItem)
+        menu.addItem(voiceCloneItem)
         menu.addItem(settingsHint)
         menu.addItem(.separator())
 
@@ -345,6 +365,11 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         if subtitlesEnabled && adviceEnabled { args.append("--advise") }
         if rehearseEnabled { args.append("--rehearse") }
         if speakEnabled { args.append("--speak") }
+        // 克隆声线只在有发言方向时有意义；凭据在选择时已校验过，
+        // Python 侧仍有 fail-closed 兜底。
+        if (rehearseEnabled || speakEnabled) && cloneVoiceEnabled {
+            args.append(contentsOf: ["--speak-engine", "clone"])
+        }
 
         let task = Process()
         task.executableURL = python
@@ -831,6 +856,34 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         render()
     }
 
+    @objc private func useStandardVoice() {
+        guard process?.isRunning != true else { return }
+        cloneVoiceEnabled = false
+        render()
+    }
+
+    @objc private func useCloneVoice() {
+        guard process?.isRunning != true else { return }
+        // 选择时即校验，不等到会议开始才失败：克隆声线需要 ElevenLabs
+        // 密钥与声线编号，缺了就给出可照做的一次性配置指引。
+        let env = loginEnvironment()
+        let missingKey = (env["ELEVENLABS_API_KEY"] ?? "").isEmpty
+        let missingVoice = (env["ELEVENLABS_VOICE_ID"] ?? "").isEmpty
+        if missingKey || missingVoice {
+            alert(
+                "还不能使用「我的声音」",
+                "需要先完成一次性配置：在 ~/.zshenv 中写入 "
+                + (missingKey ? "ELEVENLABS_API_KEY（ElevenLabs 密钥）" : "")
+                + (missingKey && missingVoice ? " 和 " : "")
+                + (missingVoice ? "ELEVENLABS_VOICE_ID（你的声线编号）" : "")
+                + "，保存后重新打开本 App。"
+            )
+            return
+        }
+        cloneVoiceEnabled = true
+        render()
+    }
+
     // MARK: - 告警：内部码 → 用户能照做的话
 
     private func userAlerts() -> [UserAlert] {
@@ -1029,6 +1082,15 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         // 排练/正式发言不依赖字幕开关：它们是独立的 Realtime 会话
         rehearseToggle.isEnabled = idle
         speakToggle.isEnabled = idle
+        // 发言声音只在有发言方向时出现：不发言的会议没有"声音"可选
+        let speakingConfigured = rehearseEnabled || speakEnabled
+        voiceHeader.isHidden = !speakingConfigured
+        voiceStandardItem.isHidden = !speakingConfigured
+        voiceCloneItem.isHidden = !speakingConfigured
+        voiceStandardItem.state = cloneVoiceEnabled ? .off : .on
+        voiceCloneItem.state = cloneVoiceEnabled ? .on : .off
+        voiceStandardItem.isEnabled = idle
+        voiceCloneItem.isEnabled = idle
         settingsHint.isHidden = idle
 
         minutesItem.isHidden = latestMinutesURL() == nil
