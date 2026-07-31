@@ -218,8 +218,12 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
         await client.stop()
         await task
 
-        # 播放器收到的只有克隆声线字节，端点内置 PCM 一个字节都不许出现。
-        self.assertEqual([CLONE_PCM_A, CLONE_PCM_B], output.chunks)
+        # 播放器收到的只有克隆声线的音频（经 90Hz 高通，长度逐块保持、
+        # 顺序即句序），端点内置 PCM 一个字节都不许出现。
+        self.assertEqual(
+            [len(CLONE_PCM_A), len(CLONE_PCM_B)],
+            [len(chunk) for chunk in output.chunks],
+        )
         self.assertNotIn(BUILTIN_PCM, output.chunks)
         # 两句译文各一次请求、按句序；source 句零请求。
         self.assertEqual(2, len(tts.requests))
@@ -238,10 +242,15 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
                 DEFAULT_CLONE_MODEL,
                 request["json"]["model_id"],
             )
-            # 2026-07-31 用户听感裁决钉成默认：turbo_v2_5 + speed 1.1。
+            # 2026-07-31 用户听感裁决（e 版）钉成默认：turbo_v2_5 +
+            # speed 1.1 + stability 0.8（完整参数组，不留服务端默认）。
             self.assertEqual("eleven_turbo_v2_5", DEFAULT_CLONE_MODEL)
             self.assertEqual(
-                {"speed": DEFAULT_CLONE_SPEED},
+                {
+                    "speed": DEFAULT_CLONE_SPEED,
+                    "stability": 0.8,
+                    "similarity_boost": 0.75,
+                },
                 request["json"]["voice_settings"],
             )
         # 文本链路原样：source/translation 两条流都正常发布。
@@ -275,7 +284,8 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
         await client.stop()
         await task
 
-        self.assertEqual([b"\x01\x02", b"\x03\x04"], output.chunks)
+        # 高通不改变字节数：5 字节裁尾后按 2+2 字节两块送达。
+        self.assertEqual([2, 2], [len(chunk) for chunk in output.chunks])
         for chunk in output.chunks:
             self.assertEqual(0, len(chunk) % 2)
         self.assertNotIn("voice_settings", tts.requests[0]["json"])
@@ -305,9 +315,40 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
         request = tts.requests[0]
         self.assertEqual("eleven_turbo_v2_5", request["json"]["model_id"])
         self.assertEqual(
-            {"speed": 1.1},
+            {"speed": 1.1, "stability": 0.8, "similarity_boost": 0.75},
             request["json"]["voice_settings"],
         )
+
+    async def test_highpass_removes_pop_band_and_keeps_speech(self) -> None:
+        # 喷麦规格：直流/超低频（"噗"声的能量所在）必须被滤除，
+        # 语音频段必须近乎无损。用可判定信号钉住 90Hz 高通的行为。
+        dc_pop = np.full(480, 8000, dtype="<i2").tobytes()  # 20ms 直流脉冲
+        tone = (  # 12kHz 交替方波：远在人声频段内侧的高频内容
+            np.tile(np.array([8000, -8000], dtype="<i2"), 240).tobytes()
+        )
+        events = [
+            {
+                "type": "session.output_transcript.delta",
+                "delta": "はい。",
+                "elapsed_ms": 100,
+            },
+        ]
+        server = MockRealtimeServer(_translations_script(events))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(dc_pop, tone))])
+        client, output, _ = self._make_client(server, tts)
+
+        task = client.start()
+        await _wait_until(lambda: len(output.chunks) >= 2)
+        await client.stop()
+        await task
+
+        filtered_dc = np.frombuffer(output.chunks[0], dtype="<i2")
+        filtered_tone = np.frombuffer(output.chunks[1], dtype="<i2")
+        # 直流被滤除：脉冲尾部衰减到接近零（原值恒为 8000）。
+        self.assertLess(int(np.abs(filtered_dc[-100:]).max()), 500)
+        # 高频内容保留：滤波后 RMS 不低于原信号的八成。
+        tone_rms = float(np.sqrt(np.mean(filtered_tone.astype(float) ** 2)))
+        self.assertGreater(tone_rms, 8000 * 0.8)
 
     async def test_tts_failure_mutes_sentence_and_continues(self) -> None:
         events = [
@@ -354,7 +395,7 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
         await task
 
         # 失败句静音、报错；下一句照常合成——单句抖动绝不整场翻车。
-        self.assertEqual([CLONE_PCM_A], output.chunks)
+        self.assertEqual([len(CLONE_PCM_A)], [len(c) for c in output.chunks])
         self.assertEqual(2, len(tts.requests))
         self.assertTrue(
             any("克隆语音合成失败" in message for message in errors),

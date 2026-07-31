@@ -21,6 +21,8 @@ import asyncio
 from typing import Any, Callable
 
 import aiohttp
+import numpy as np
+from scipy import signal as sp_signal
 
 from .interpreter import RealtimeInterpreter
 
@@ -30,6 +32,38 @@ from .interpreter import RealtimeInterpreter
 # PVC 样本朗读偏慢（"语速比较慢"同一裁决）。
 DEFAULT_CLONE_MODEL = "eleven_turbo_v2_5"
 DEFAULT_CLONE_SPEED = 1.1
+# 与 speed 一起构成完整 voice_settings（只发部分字段时其余走服务端
+# 默认，行为不可复现）；stability 0.8 抑制爆破音瑕疵，同为 e 版裁决。
+DEFAULT_CLONE_STABILITY = 0.8
+DEFAULT_CLONE_SIMILARITY_BOOST = 0.75
+# 喷麦（爆破音"噗"声）能量集中在 100Hz 以下、人声基频之上无内容；
+# 90Hz 二阶高通是录音行业标准除喷麦手段。2026-07-31 用户听感裁决
+# （e 版"最干净、音色也没变"）钉为 clone 引擎固定出口处理。
+CLONE_HIGHPASS_HZ = 90.0
+_HIGHPASS_SOS = sp_signal.butter(
+    2,
+    CLONE_HIGHPASS_HZ,
+    btype="highpass",
+    fs=24_000,
+    output="sos",
+)
+
+
+class _SentenceHighpass:
+    """单句内跨块携带滤波器状态；句间重置（喷麦是句内瞬态）。
+
+    纯 numpy/scipy 计算，运行在 TTS 工作者协程里，不触碰 PortAudio。
+    """
+
+    def __init__(self) -> None:
+        self._zi = np.zeros((_HIGHPASS_SOS.shape[0], 2))
+
+    def process(self, data: bytes) -> bytes:
+        samples = np.frombuffer(data, dtype="<i2").astype(np.float64)
+        filtered, self._zi = sp_signal.sosfilt(
+            _HIGHPASS_SOS, samples, zi=self._zi
+        )
+        return np.clip(filtered, -32768, 32767).astype("<i2").tobytes()
 # ElevenLabs voice_settings.speed 的合法区间（官方文档 0.7–1.2）；
 # None=不发该字段，用声线自带默认语速。
 CLONE_SPEED_MIN = 0.7
@@ -154,7 +188,11 @@ class CloneSpeechSession(RealtimeInterpreter):
             "model_id": self._clone_model,
         }
         if self._clone_speed is not None:
-            body["voice_settings"] = {"speed": self._clone_speed}
+            body["voice_settings"] = {
+                "speed": self._clone_speed,
+                "stability": DEFAULT_CLONE_STABILITY,
+                "similarity_boost": DEFAULT_CLONE_SIMILARITY_BOOST,
+            }
         async with session.post(
             ELEVENLABS_TTS_URL.format(voice_id=self._voice_id),
             params={"output_format": CLONE_OUTPUT_FORMAT},
@@ -168,6 +206,7 @@ class CloneSpeechSession(RealtimeInterpreter):
                 )
             # 裸 PCM16 流的块边界可能落在奇数字节上；攒住尾字节，
             # 保证 feed_pcm16 恒收偶数长度（其契约会对奇数长度抛错）。
+            highpass = _SentenceHighpass()
             carry = b""
             async for chunk in response.content.iter_chunked(4096):
                 data = carry + chunk
@@ -176,7 +215,7 @@ class CloneSpeechSession(RealtimeInterpreter):
                 else:
                     carry = b""
                 if data:
-                    self._output_player.feed_pcm16(data)
+                    self._output_player.feed_pcm16(highpass.process(data))
 
     async def stop(self) -> None:
         # 会议结束即停声：残句文本仍会被父类 _flush_text 发布到面板，
