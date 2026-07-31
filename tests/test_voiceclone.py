@@ -261,6 +261,9 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
                 },
                 request["json"]["voice_settings"],
             )
+            # 译文恒为日语：锁死 TTS 语言判定（纯汉字数字串曾被自动
+            # 判成中文朗读）。
+            self.assertEqual("ja", request["json"]["language_code"])
         # 文本链路原样：source/translation 两条流都正常发布。
         self.assertEqual(
             [
@@ -326,6 +329,31 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
             {"speed": 1.1, "stability": 0.8, "similarity_boost": 0.75},
             request["json"]["voice_settings"],
         )
+        self.assertEqual("ja", request["json"]["language_code"])
+
+    async def test_multilingual_model_omits_language_code(self) -> None:
+        # multilingual_v2 不接受 language_code：发了就是每句 400。
+        events = [
+            {
+                "type": "session.output_transcript.delta",
+                "delta": "はい。",
+                "elapsed_ms": 100,
+            },
+        ]
+        server = MockRealtimeServer(_translations_script(events))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(CLONE_PCM_A,))])
+        client, output, _ = self._make_client(
+            server,
+            tts,
+            clone_model="eleven_multilingual_v2",
+        )
+
+        task = client.start()
+        await _wait_until(lambda: len(output.chunks) >= 1)
+        await client.stop()
+        await task
+
+        self.assertNotIn("language_code", tts.requests[0]["json"])
 
     async def test_highpass_removes_pop_band_and_keeps_speech(self) -> None:
         # 喷麦规格：直流/超低频（"噗"声的能量所在）必须被滤除，

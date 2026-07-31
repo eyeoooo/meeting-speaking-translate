@@ -65,6 +65,15 @@ CLONE_SPEED_MIN = 0.7
 CLONE_SPEED_MAX = 1.2
 # 单句合成的总超时：超时=该句静音并继续，绝不悬挂工作者。
 TTS_SENTENCE_TIMEOUT_SECONDS = 30.0
+# 发言译文恒为日语（clone/cascade 共同的产品契约），TTS 语言锁死：
+# 纯汉字数字串等无假名文本会被自动判成中文朗读（2026-07-31 真人复验
+# 实锤：「一二三四五」被用中文念出）。language_code 仅 turbo/flash
+# 家族支持，multilingual_v2 不收该参数。
+TTS_LANGUAGE_CODE = "ja"
+
+
+def _model_supports_language_code(model: str) -> bool:
+    return "turbo" in model or "flash" in model
 
 
 class _SentenceHighpass:
@@ -195,6 +204,8 @@ class ElevenLabsSpeaker:
             "text": sentence,
             "model_id": self._model,
         }
+        if _model_supports_language_code(self._model):
+            body["language_code"] = TTS_LANGUAGE_CODE
         if self._speed is not None:
             body["voice_settings"] = {
                 "speed": self._speed,

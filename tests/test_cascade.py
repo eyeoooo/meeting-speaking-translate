@@ -109,6 +109,10 @@ class CascadeConstructionTests(unittest.TestCase):
         # 出口恒为日语、日语入口直通不回译——用户既说中文也说日语。
         self.assertIn("输出永远是日语", system)
         self.assertIn("原文已是日语", system)
+        # 真人复验红线：半句/片段绝不补全（曾把「納品」补成
+        # 「納品いたします」）；译文数字阿拉伯表记（TTS 朗读稳定）。
+        self.assertIn("绝不替说话人补全句子", system)
+        self.assertIn("阿拉伯数字表记", system)
         user = build_translation_user(
             [("你好。", "こんにちは。")], "第七批设备"
         )
@@ -182,6 +186,8 @@ class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
         # 热词注入口：数字纪律 + 多语言引导 + 术语表。
         self.assertIn("阿拉伯数字", transcription["prompt"])
         self.assertIn("日语或英语", transcription["prompt"])
+        # 内置商务热词兜底（真人复验实锤「納品」误听）+ 用户术语表。
+        self.assertIn("納品", transcription["prompt"])
         self.assertIn("KVM=ケーブーエム", transcription["prompt"])
         self.assertEqual(
             "server_vad",
