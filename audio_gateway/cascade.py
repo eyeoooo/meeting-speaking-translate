@@ -57,11 +57,18 @@ TRANSLATE_TIMEOUT_SECONDS = 15.0
 # 自回声防线（2026-07-31 真人复验实锤）：耳机漏音把系统自己的日语
 # 采回麦克风，而"日语直通"规则会把它原样复读——用户听到"没说过的话"。
 # 凡与最近说过的译文高度相似的转写，判为自回声直接丢弃。
-ECHO_WINDOW_SECONDS = 90.0
+ECHO_WINDOW_SECONDS = 30.0
 ECHO_SIMILARITY_THRESHOLD = 0.80
 ECHO_RECENT_SENTENCES = 16
 # 太短的转写不做回声判定：「はい」这类高频短语误杀风险大于收益。
 ECHO_MIN_CHARS = 4
+# 回声只可能出现在系统正在出声的窗口内（播放结束后留声学余量）。
+# 2026-07-31 真人复验教训：不看播放窗口的相似度判定会把用户本人的
+# 日语发言误杀——用户说日语时系统若是安静的，绝不可能是回声。
+ECHO_PLAYBACK_GRACE_SECONDS = 3.0
+# 翻译子任务收尸限时：超时强杀后 SDK 清理若悬挂，弃车保帅——
+# 工作者必须活着（2026-07-31 实锤：一次悬挂让其后所有句子全部静音）。
+TRANSLATE_REAP_SECONDS = 2.0
 
 _ECHO_STRIP = re.compile(r"[\s。、．，,.！？!?：:；;「」『』()（）\-]")
 
@@ -426,36 +433,60 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         self._consume_text_delta("translation", "\n", None)
         return "".join(parts).strip()
 
+    async def _translate_one(self, text: str) -> str | None:
+        """单句翻译（流式/整句两种翻译器契约并存），供隔离子任务执行。
+
+        流式路径边到边发布并自行入上下文，返回 None（尾部整句发布
+        逻辑绝不能再跑一遍——否则双份出声）；整句路径返回全文。
+        """
+        result = self._translate(text, list(self._context))
+        if hasattr(result, "__aiter__"):
+            translated = await self._consume_translation_stream(result)
+            if translated:
+                self._context.append((text, translated))
+            return None
+        return await result
+
     async def _translator_worker(self) -> None:
         # 单工作者串行翻译：句序即播放序；上下文追加也因此无竞态。
+        # 每句隔离成子任务：2026-07-31 实锤一次翻译调用在取消清理时
+        # 悬挂，把工作者整个卡死——其后所有句子（任何语言）全部静音，
+        # 用户体感"日语被过滤"。超时强杀 + 收尸限时，工作者必须活着。
         while True:
             kind, text = await self._translation_queue.get()
             if kind == "digits":
                 # 数字直通：零模型、零延迟、零幻觉。
                 self._consume_text_delta("translation", text + "\n", None)
                 continue
+            job = asyncio.get_running_loop().create_task(
+                self._translate_one(text),
+                name="cascade-translate-one",
+            )
             try:
-                result = self._translate(text, list(self._context))
-                if hasattr(result, "__aiter__"):
-                    # 流式翻译器：delta 边到边发布（测试用假翻译器
-                    # 仍可返回协程整句，两种契约并存）。
-                    translated = await asyncio.wait_for(
-                        self._consume_translation_stream(result),
-                        TRANSLATE_TIMEOUT_SECONDS,
-                    )
-                    if translated:
-                        self._context.append((text, translated))
-                    continue
                 translated = await asyncio.wait_for(
-                    result,
+                    asyncio.shield(job),
                     TRANSLATE_TIMEOUT_SECONDS,
                 )
+            except asyncio.TimeoutError:
+                job.cancel()
+                try:
+                    await asyncio.wait_for(job, TRANSLATE_REAP_SECONDS)
+                except (asyncio.TimeoutError, Exception):
+                    pass  # 清理悬挂就弃车保帅，绝不陪葬
+                self._report_error(
+                    "级联翻译超时，该句静音（原文字幕不受影响）"
+                )
+                continue
             except asyncio.CancelledError:
+                job.cancel()
                 raise
             except Exception as exc:
                 self._report_error(
                     f"级联翻译失败，该句静音（原文字幕不受影响）：{exc}"
                 )
+                continue
+            if translated is None:
+                # 流式路径已发布并入上下文。
                 continue
             translated = (translated or "").strip()
             if not translated:
@@ -487,14 +518,23 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         return task
 
     def _is_self_echo(self, transcript: str) -> bool:
+        now = time.monotonic()
+        # 前提：系统正在出声（或刚停 3 秒内）。安静时段的任何发言都是
+        # 用户本人的——哪怕逐字复述系统刚才的话，也照常翻译。
+        if now > self._speaker.playback_active_until + (
+            ECHO_PLAYBACK_GRACE_SECONDS
+        ):
+            return False
         candidate = _normalize_for_echo(transcript)
         if len(candidate) < ECHO_MIN_CHARS:
             return False
-        now = time.monotonic()
         for spoken_at, spoken in self._recent_speech:
             if now - spoken_at > ECHO_WINDOW_SECONDS:
                 continue
-            if candidate in spoken or spoken in candidate:
+            # 只保留 candidate ⊆ spoken 方向（漏音只采到我们长句的
+            # 片段）；反向 spoken ⊆ candidate 会把"用户长句里恰好包含
+            # 我们说过的短语"误杀。
+            if candidate in spoken:
                 return True
             ratio = difflib.SequenceMatcher(
                 None, candidate, spoken

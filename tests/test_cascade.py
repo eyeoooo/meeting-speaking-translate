@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -503,6 +504,92 @@ class CascadeStreamingTranslatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["两句话的发言"], calls)
 
 
+class CascadeWorkerSurvivalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hanging_translation_does_not_kill_worker(self) -> None:
+        # 2026-07-31 实锤：一次翻译调用在取消清理时悬挂，把单工作者
+        # 整个卡死——其后所有句子（任何语言）全部静音，用户体感
+        # "日语被过滤"。规格：超时强杀+收尸限时，下一句必须照常翻译。
+        calls: list[str] = []
+
+        def factory(api_key, model, system_text):
+            async def translate(text, context):
+                calls.append(text)
+                if len(calls) == 1:
+                    try:
+                        await asyncio.Event().wait()  # 永不返回
+                        yield ""
+                    finally:
+                        # 模拟 SDK 清理悬挂：取消后仍拖 30s
+                        try:
+                            await asyncio.sleep(30)
+                        except asyncio.CancelledError:
+                            pass
+                else:
+                    yield "二文目です。"
+
+            return translate
+
+        events = [
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "第一句会悬挂",
+            },
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "第二句必须活着",
+            },
+        ]
+        server = MockRealtimeServer(_transcription_script(events))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(CLONE_PCM,))])
+        errors: list[str] = []
+        output = SpyOutputPlayer()
+        state = InterpreterState(
+            enabled=True,
+            lang="ja",
+            interpret_voice=True,
+        )
+        client = CascadeSpeechSession(
+            Tap("rehearsal", maxsize=8, drop_oldest=True),
+            output,
+            api_key="mock-key-never-sent-to-openai",
+            anthropic_api_key="ant-mock-key",
+            elevenlabs_api_key="el-mock-key",
+            voice_id="voice-clone-1",
+            safety_identifier="hashed-test-user",
+            url=server.url,
+            state=state,
+            on_error=errors.append,
+            session_factory=server.session_factory,
+            translator_factory=factory,
+            tts_session_factory=lambda: tts,
+        )
+
+        with patch.multiple(
+            "audio_gateway.cascade",
+            TRANSLATE_TIMEOUT_SECONDS=0.3,
+            TRANSLATE_REAP_SECONDS=0.1,
+        ):
+            task = client.start()
+            await _wait_until(lambda: len(tts.requests) >= 1, timeout=5.0)
+            await client.stop()
+            await task
+
+        # 第一句超时报错、第二句照常出声——工作者活着。
+        self.assertEqual(
+            ["二文目です。"],
+            [request["json"]["text"] for request in tts.requests],
+        )
+        self.assertTrue(
+            any("级联翻译超时" in message for message in errors),
+            errors,
+        )
+        self.assertEqual(["第一句会悬挂", "第二句必须活着"], calls)
+
+
 class CascadeEchoGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_recent_speech_is_dropped_as_self_echo(self) -> None:
         # 真人复验实锤：耳机漏音把系统自己的日语采回麦克风，
@@ -546,6 +633,23 @@ class CascadeEchoGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client._translation_queue.empty())
         # 超短转写不做回声判定（误杀风险）
         self.assertFalse(client._is_self_echo("はい"))
+
+        # 方向性：用户长句里恰好包含我们说过的短语——不是回声。
+        # （真人复验教训：反向包含判定曾把用户本人的日语发言误杀）
+        self.assertFalse(
+            client._is_self_echo(
+                "本日は見積もりについてご説明の件でお電話しました"
+            )
+        )
+
+        # 播放窗口前提：系统安静（播放已结束超过余量）时，哪怕逐字
+        # 复述系统刚才的话，也是用户本人发言，绝不判回声。
+        client._speaker._playback_until = time.monotonic() - 10.0
+        self.assertFalse(
+            client._is_self_echo(
+                "それでは、見積もりについてご説明します。"
+            )
+        )
 
         await client.stop()
         await task

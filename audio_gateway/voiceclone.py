@@ -22,6 +22,7 @@ ElevenLabs 出口本体抽成 ElevenLabsSpeaker：cascade 引擎（分句级联�
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Callable
 
 import aiohttp
@@ -137,10 +138,17 @@ class ElevenLabsSpeaker:
         )
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
+        # 播放窗口推算（monotonic）：按已喂入 PCM 时长累计。回声只可能
+        # 出现在"正在出声"的窗口内——cascade 的自回声判定以此为前提。
+        self._playback_until = 0.0
 
     @property
     def voice_id(self) -> str:
         return self._voice_id
+
+    @property
+    def playback_active_until(self) -> float:
+        return self._playback_until
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._task is None or self._task.done():
@@ -235,6 +243,10 @@ class ElevenLabsSpeaker:
                     carry = b""
                 if data:
                     self._output_player.feed_pcm16(highpass.process(data))
+                    duration = len(data) / 2 / 24_000
+                    now = time.monotonic()
+                    base = max(self._playback_until, now)
+                    self._playback_until = base + duration
 
 
 class CloneSpeechSession(RealtimeInterpreter):
