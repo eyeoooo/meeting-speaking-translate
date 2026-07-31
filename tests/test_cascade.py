@@ -31,6 +31,7 @@ from audio_gateway.cascade import (  # noqa: E402
     CascadeSpeechSession,
     build_translation_system,
     build_translation_user,
+    render_digit_readout,
 )
 from audio_gateway.interpreter import InterpreterState  # noqa: E402
 from test_interpreter import (  # noqa: E402
@@ -122,6 +123,21 @@ class CascadeConstructionTests(unittest.TestCase):
         self.assertIn("中：你好。", user)
         self.assertIn("日：こんにちは。", user)
         self.assertTrue(user.endswith("第七批设备"))
+
+
+class DigitReadoutTests(unittest.TestCase):
+    def test_readout_renders_tuten_separated_arabic(self) -> None:
+        # 机器耳朵实测：顿号分隔是唯一被日语逐位朗读的写法。
+        self.assertEqual(
+            "1、2、3、4、5", render_digit_readout("一二三四五。")
+        )
+        self.assertEqual(
+            "1、2、3、4、5", render_digit_readout("12345")
+        )
+        self.assertEqual(
+            "1、2、3、4、5、1、2、3、4、5",
+            render_digit_readout("一二三四五，一二三四五。"),
+        )
 
 
 class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -273,6 +289,96 @@ class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
             sentence_calls[1],
         )
 
+    async def test_digit_readout_bypasses_translator_deterministically(
+        self,
+    ) -> None:
+        # 真人复验实锤：数字串交给翻译模型会连写/复读/凭空递增。
+        # 直通规则：零模型、不进上下文；「三百」是数值不是逐位串，
+        # 仍走翻译层。
+        events = [
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "一二三四五。",
+            },
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "总共三百台。",
+            },
+        ]
+        server = MockRealtimeServer(_transcription_script(events))
+        tts = _FakeTtsSession([
+            _FakeTtsResponse(chunks=(CLONE_PCM,)),
+            _FakeTtsResponse(chunks=(CLONE_PCM,)),
+        ])
+        calls: list = []
+        translator = _fake_translator_factory(["合計300台です。"], calls)
+        client, output, segments = self._make_client(server, tts, translator)
+
+        task = client.start()
+        await _wait_until(lambda: len(output.chunks) >= 2)
+        await client.stop()
+        await task
+
+        self.assertEqual(
+            ["1、2、3、4、5", "合計300台です。"],
+            [request["json"]["text"] for request in tts.requests],
+        )
+        sentence_calls = [c for c in calls if isinstance(c, tuple)]
+        # 翻译模型只见过「三百台」那句；数字串没进模型也没进上下文。
+        self.assertEqual([("总共三百台。", [])], sentence_calls)
+
+    async def test_hangul_and_duplicates_are_filtered(self) -> None:
+        # 谚文=ASR 幻听整句丢弃；同句连发两次 completed 只处理一次。
+        events = [
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "한인상 영어고",
+            },
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "开始测试。",
+            },
+            {
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": "开始测试。",
+            },
+        ]
+        server = MockRealtimeServer(_transcription_script(events))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(CLONE_PCM,))])
+        errors: list[str] = []
+        calls: list = []
+        translator = _fake_translator_factory(
+            ["テストを開始します。"], calls
+        )
+        client, output, segments = self._make_client(
+            server, tts, translator, on_error=errors.append
+        )
+
+        task = client.start()
+        await _wait_until(lambda: len(output.chunks) >= 1)
+        await client.stop()
+        await task
+
+        sentence_calls = [c for c in calls if isinstance(c, tuple)]
+        self.assertEqual([("开始测试。", [])], sentence_calls)
+        self.assertEqual(
+            ["テストを開始します。"],
+            [request["json"]["text"] for request in tts.requests],
+        )
+        self.assertTrue(
+            any("已忽略" in message for message in errors), errors
+        )
+
     async def test_translation_failure_mutes_sentence_and_continues(
         self,
     ) -> None:
@@ -322,6 +428,76 @@ class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
             ("translation", "二文目です。"),
             [(s.stream, s.text) for s in segments],
         )
+
+
+class CascadeEchoGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recent_speech_is_dropped_as_self_echo(self) -> None:
+        # 真人复验实锤：耳机漏音把系统自己的日语采回麦克风，
+        # "日语直通"会把它原样复读——用户听到"没说过的话"。
+        # 防线：与最近说过的译文高度相似的转写整句丢弃。
+        server = MockRealtimeServer(_transcription_script([]))
+        tts = _FakeTtsSession([_FakeTtsResponse(chunks=(CLONE_PCM,))])
+        client, output, _ = self._make(server, tts)
+
+        task = client.start()
+        # 系统说出一句译文（进入比对集）
+        client._publish_segment(
+            "translation", "それでは、見積もりについてご説明します。", None
+        )
+        await _wait_until(lambda: len(output.chunks) >= 1)
+
+        # 完全相同、标点差异、部分截取——都是回声，全部丢弃
+        for echo in (
+            "それでは、見積もりについてご説明します。",
+            "それでは 見積もりについて ご説明します",
+            "見積もりについてご説明",
+        ):
+            client.handle_server_event({
+                "type": (
+                    "conversation.item.input_audio_transcription.completed"
+                ),
+                "transcript": echo,
+            })
+        self.assertTrue(client._translation_queue.empty())
+
+        # 真实的新发言不受影响
+        client.handle_server_event({
+            "type": (
+                "conversation.item.input_audio_transcription.completed"
+            ),
+            "transcript": "納期はいつ確定しますか。",
+        })
+        self.assertFalse(client._translation_queue.empty())
+        # 超短转写不做回声判定（误杀风险）
+        self.assertFalse(client._is_self_echo("はい"))
+
+        await client.stop()
+        await task
+
+    def _make(self, server, tts_session):
+        output = SpyOutputPlayer()
+        state = InterpreterState(
+            enabled=True,
+            lang="ja",
+            interpret_voice=True,
+        )
+        segments: list = []
+        client = CascadeSpeechSession(
+            Tap("rehearsal", maxsize=8, drop_oldest=True),
+            output,
+            api_key="mock-key-never-sent-to-openai",
+            anthropic_api_key="ant-mock-key",
+            elevenlabs_api_key="el-mock-key",
+            voice_id="voice-clone-1",
+            safety_identifier="hashed-test-user",
+            url=server.url,
+            state=state,
+            on_sentence=segments.append,
+            session_factory=server.session_factory,
+            translator_factory=_fake_translator_factory([], []),
+            tts_session_factory=lambda: tts_session,
+        )
+        return client, output, segments
 
 
 class CascadeWiringTests(unittest.TestCase):

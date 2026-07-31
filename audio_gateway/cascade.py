@@ -29,6 +29,9 @@ session.update 形状以真机 session.updated 回显为准，未知服务端事
 from __future__ import annotations
 
 import asyncio
+import difflib
+import re
+import time
 from collections import deque
 from typing import Any, Callable
 
@@ -51,6 +54,47 @@ DEFAULT_CASCADE_TRANSLATE_MODEL = "claude-haiku-4-5"
 CASCADE_CONTEXT_PAIRS = 12
 # 单句翻译总超时：超时=该句静音+报错+继续，绝不悬挂工作者。
 TRANSLATE_TIMEOUT_SECONDS = 15.0
+# 自回声防线（2026-07-31 真人复验实锤）：耳机漏音把系统自己的日语
+# 采回麦克风，而"日语直通"规则会把它原样复读——用户听到"没说过的话"。
+# 凡与最近说过的译文高度相似的转写，判为自回声直接丢弃。
+ECHO_WINDOW_SECONDS = 90.0
+ECHO_SIMILARITY_THRESHOLD = 0.80
+ECHO_RECENT_SENTENCES = 16
+# 太短的转写不做回声判定：「はい」这类高频短语误杀风险大于收益。
+ECHO_MIN_CHARS = 4
+
+_ECHO_STRIP = re.compile(r"[\s。、．，,.！？!?：:；;「」『』()（）\-]")
+
+
+def _normalize_for_echo(text: str) -> str:
+    return _ECHO_STRIP.sub("", text)
+
+# 谚文（韩语字母）——说话人只说中/日/英，转写出现谚文=ASR 幻听
+# （真机实锤：数字串音频被 gpt-4o-transcribe 幻听成韩语碎片）。
+# fail-safe：整句丢弃并报告，绝不让幻听进入翻译与 TTS。
+_HANGUL_RE = re.compile(r"[ᄀ-ᇿ㄰-㆏가-힯]")
+# 逐位数字串（数数/逐位报编号）：只含数字字符与分隔标点的整句。
+# 刻意不含 十/百/千/万——「三百」是数值不是逐位串，交给翻译层。
+_DIGIT_READOUT_RE = re.compile(
+    r"^[0-9０-９〇零一二三四五六七八九、，,．.。！!？?\s]+$"
+)
+_DIGIT_MAP = {
+    **{c: str(i) for i, c in enumerate("〇一二三四五六七八九")},
+    "零": "0",
+    **{c: str(i) for i, c in enumerate("０１２３４５６７８９")},
+    **{str(i): str(i) for i in range(10)},
+}
+
+
+def render_digit_readout(text: str) -> str:
+    """逐位数字串 → 顿号分隔阿拉伯数字（机器耳朵实测的唯一日语读法）。
+
+    2026-07-31 真人复验实锤：这条路交给翻译模型会出现连写
+    （「12345」→TTS 读成韩语）、复读（「12345、12345」）甚至
+    凭空递增（「12、13、14、15」）。确定性的东西用确定性代码。
+    """
+    digits = [_DIGIT_MAP[ch] for ch in text if ch in _DIGIT_MAP]
+    return "、".join(digits)
 
 
 def build_asr_prompt(glossary: str) -> str:
@@ -66,7 +110,8 @@ def build_asr_prompt(glossary: str) -> str:
         "数字、日期、金额、编号请逐位准确转写为阿拉伯数字。"
         # 内置商务热词兜底：真人复验实锤「納品」被误听。用户术语表
         # （brief.md）在此之外追加。
-        "高频词：納品、納期、見積もり、出荷、検収、発注、単価、品質保証。"
+        "高频词：納品、納期、見積もり、出荷、検収、発注、単価、"
+        "品質保証、バッチ、批处理、オンライン。"
     )
     if glossary:
         prompt += f"可能出现的术语与专有名词：{glossary}"
@@ -116,7 +161,15 @@ def build_translation_system(glossary: str) -> str:
         "（半句保持半句，绝不补「ありがとうございます」）\n"
         "原文「納品」→ 納品\n"
         "（单词保持单词，绝不补「いたします」）\n"
+        "原文「今」→ いま\n"
+        "（孤立的单个汉字用假名表记——朗读语言才稳定；两字以上的"
+        "常用词保持汉字）\n"
         "原文「一二三四五」→ 1、2、3、4、5\n"
+        "原文「我现在数一组数字，一二三四五。」→ これから数字を"
+        "読み上げます。1、2、3、4、5。\n"
+        "（数字前后的话照译，一个字都不丢）\n"
+        "原文「订单编号是12345。」→ 注文番号は1、2、3、4、5です。\n"
+        "（编号、工号等逐位读的数字，句中也用顿号分隔）\n"
         "原文「我想请问一下，」→ ちょっとお伺いしたいのですが、\n"
         "原文「我们下周三之前需要收到贵方的正式报价。」→ "
         "来週の水曜日までに、貴社の正式なお見積もりをいただく必要が"
@@ -245,11 +298,22 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
             translate_model,
             self._system_prompt,
         )
-        self._translation_queue: asyncio.Queue[str] = asyncio.Queue()
+        # 队列元素 ("text", 原文) 或 ("digits", 已渲染的逐位串)——
+        # 数字直通也走队列，保证与翻译句的先后次序。
+        self._translation_queue: asyncio.Queue[tuple[str, str]] = (
+            asyncio.Queue()
+        )
         self._translator_task: asyncio.Task[None] | None = None
+        # ASR 偶发对同一句连发两次 completed（真机实锤：首句被译两遍）；
+        # 连续完全相同的转写只处理一次。
+        self._last_transcript = ""
         # 滚动上下文只进翻译成功的句对：失败句不留污染。
         self._context: deque[tuple[str, str]] = deque(
             maxlen=CASCADE_CONTEXT_PAIRS
+        )
+        # 最近说出的译文（归一化）：自回声判定的比对集。
+        self._recent_speech: deque[tuple[float, str]] = deque(
+            maxlen=ECHO_RECENT_SENTENCES
         )
 
     @property
@@ -298,7 +362,15 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
             self._consume_text_delta("source", "\n", None)
             transcript = event.get("transcript")
             if isinstance(transcript, str) and transcript.strip():
-                self._enqueue_translation(transcript.strip())
+                text = transcript.strip()
+                if self._is_self_echo(text):
+                    # 回环不进翻译、不出声；打进日志供事后归因。
+                    print(
+                        f"[cascade] 疑似自回声，已忽略：{text[:48]}",
+                        flush=True,
+                    )
+                else:
+                    self._enqueue_translation(text)
             return False
         if event_type == "error":
             import json as _json
@@ -315,8 +387,23 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
     def _enqueue_translation(self, text: str) -> None:
         if self._stop_event.is_set():
             return
+        # 谚文防火墙：说话人只说中/日/英，出现韩语=转写幻听，整句丢弃。
+        if _HANGUL_RE.search(text):
+            self._report_error("有一句没听清（转写异常），已忽略")
+            return
+        # 同句去重：ASR 偶发连发两次 completed。
+        if text == self._last_transcript:
+            return
+        self._last_transcript = text
         self._ensure_translator()
-        self._translation_queue.put_nowait(text)
+        # 逐位数字串确定性直通：不进翻译模型（防连写/复读/递增），
+        # 不进滚动上下文（对术语一致性无价值，还会被模型回声）。
+        if len(text) >= 2 and _DIGIT_READOUT_RE.match(text):
+            rendered = render_digit_readout(text)
+            if rendered:
+                self._translation_queue.put_nowait(("digits", rendered))
+                return
+        self._translation_queue.put_nowait(("text", text))
 
     def _ensure_translator(self) -> None:
         if self._translator_task is None or self._translator_task.done():
@@ -328,7 +415,11 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
     async def _translator_worker(self) -> None:
         # 单工作者串行翻译：句序即播放序；上下文追加也因此无竞态。
         while True:
-            text = await self._translation_queue.get()
+            kind, text = await self._translation_queue.get()
+            if kind == "digits":
+                # 数字直通：零模型、零延迟、零幻觉。
+                self._consume_text_delta("translation", text + "\n", None)
+                continue
             try:
                 translated = await asyncio.wait_for(
                     self._translate(text, list(self._context)),
@@ -343,6 +434,10 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                 continue
             translated = (translated or "").strip()
             if not translated:
+                continue
+            # 出口防火墙：译文里出现谚文同样按事故丢弃。
+            if _HANGUL_RE.search(translated):
+                self._report_error("有一句翻译异常，已忽略")
                 continue
             self._context.append((text, translated))
             # 走既有断句→发布链：多句译文自然拆分，_publish_segment
@@ -366,6 +461,23 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
             )
         return task
 
+    def _is_self_echo(self, transcript: str) -> bool:
+        candidate = _normalize_for_echo(transcript)
+        if len(candidate) < ECHO_MIN_CHARS:
+            return False
+        now = time.monotonic()
+        for spoken_at, spoken in self._recent_speech:
+            if now - spoken_at > ECHO_WINDOW_SECONDS:
+                continue
+            if candidate in spoken or spoken in candidate:
+                return True
+            ratio = difflib.SequenceMatcher(
+                None, candidate, spoken
+            ).ratio()
+            if ratio >= ECHO_SIMILARITY_THRESHOLD:
+                return True
+        return False
+
     def _publish_segment(
         self,
         kind: str,
@@ -375,6 +487,10 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         super()._publish_segment(kind, sentence, elapsed_ms)
         if kind != "translation" or self._stop_event.is_set():
             return
+        # 先记账再发声：说出去的每句话都是自回声判定的比对集。
+        normalized = _normalize_for_echo(sentence)
+        if normalized:
+            self._recent_speech.append((time.monotonic(), normalized))
         self._speaker.ensure_started()
         self._speaker.enqueue(sentence)
 
