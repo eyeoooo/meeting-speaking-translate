@@ -104,6 +104,20 @@ open ~/Applications/会议助手.app
 ```
 
 In Teams: **Speaker → `BlackHole 2ch`**, **Microphone → `BlackHole 16ch`**.
+
+Optional, recommended: nobody remembers which BlackHole is which in the
+Teams picker. This wraps each one in a friendly-named aggregate device
+(pure macOS mechanism — audio and the bridge's device matching are
+unaffected):
+
+```bash
+swift tools/make_named_devices.swift
+```
+
+Then pick **会议助手·扬声器** as the speaker and **会议助手·麦克风** as the
+microphone instead. Custom names via `--speaker-name` / `--mic-name`
+(must not contain "BlackHole"); `--undo` removes them.
+
 Then click *Start this meeting* in the menu bar. Try speaking safely first
 with *Rehearsal* mode — your Japanese plays only into your own headphones.
 
@@ -116,7 +130,7 @@ development. Some rules that shaped it:
 
 - **Real-device acceptance** — every change is validated on the production
   Mac with replay corpora before merging; commit messages carry the evidence
-- **Tests only get stronger** — 234 tests and counting; a spec, once pinned,
+- **Tests only get stronger** — 242 tests and counting; a spec, once pinned,
   is never weakened
 - **Machine-ear loop** — anything that affects speech output is verified by
   synthesizing audio and blind-transcribing it back

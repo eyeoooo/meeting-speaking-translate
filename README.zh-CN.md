@@ -46,8 +46,8 @@ Teams 扬声器 → BlackHole 2ch → bridge ├─ 本机播放（你听会议�
 | 项目 | 基线 |
 |---|---|
 | 虚拟声卡 | BlackHole 2ch（会议→采集）与 BlackHole 16ch（发言→会议），两者必须是**不同设备**（同设备会形成翻译回环，启动时 fail-closed） |
-| Teams 音频设置 | 扬声器 = `BlackHole 2ch`；麦克风 = `BlackHole 16ch`。说话时确认 Teams 的扬声器电平条在动——接错的典型症状是整场无字幕、录音为数字零 |
-| 你自己的耳朵/嘴 | 系统默认输出 = 你的耳机（bridge `--monitor system` 回放会议原声）；默认输入 = 你的耳麦（发言采集跟随系统默认） |
+| Teams 音频设置 | 扬声器 = `BlackHole 2ch`；麦克风 = `BlackHole 16ch`。说话时确认 Teams 的扬声器电平条在动——接错的典型症状是整场无字幕、录音为数字零。嫌两块 BlackHole 分不清，跑一次 `swift tools/make_named_devices.swift`，Teams 里改选「会议助手·扬声器」「会议助手·麦克风」（语义名聚合设备，声音与关键字匹配不受影响；`--undo` 撤销） |
+| 你自己的耳朵/嘴 | 默认输入 = 你的耳麦（发言采集跟随系统默认）。会议原声：发言/排练模式下自动改道进你的耳麦（与你的日语同一台设备，2026-07-31 监听归耳裁定）；纯字幕模式跟随系统默认输出 |
 | 采样率 | 48000 Hz（Realtime 链路的采集契约） |
 | 麦克风 TCC | 归 会议助手.app（bundle id `dev.controller-agent.audio-gateway`）；命令行排障时归图形 Terminal |
 

@@ -30,3 +30,5 @@ jobs:
           cd app
           swiftc -warnings-as-errors -parse-as-library -typecheck \
             GatewayMenuBar.swift MeetingCaptionsWindow.swift
+      - name: Typecheck tools (top-level scripts, no -parse-as-library)
+        run: swiftc -warnings-as-errors -typecheck tools/make_named_devices.swift
