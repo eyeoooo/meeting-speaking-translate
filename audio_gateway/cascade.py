@@ -191,6 +191,8 @@ def build_translation_system(glossary: str) -> str:
         "（数字前后的话照译，一个字都不丢）\n"
         "原文「订单编号是12345。」→ 注文番号は1、2、3、4、5です。\n"
         "（编号、工号等逐位读的数字，句中也用顿号分隔）\n"
+        "原文「数量是300台。」→ 数量は300台でございます。\n"
+        "（数量、金额、日期是数值，写整数，绝不拆成「3、0、0」）\n"
         "原文「我想请问一下，」→ ちょっとお伺いしたいのですが、\n"
         "原文「我们下周三之前需要收到贵方的正式报价。」→ "
         "来週の水曜日までに、貴社の正式なお見積もりをいただく必要が"
@@ -623,16 +625,26 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         text = sentence.strip()
         if not text or self._stop_event.is_set():
             return
-        # 幻听语速闸（句级）：从本 utterance 语音起点累计。语音已停
-        # （冲刷残句）时无起点可算，由 completed 降级路的闸兜底。
-        if self._speech_started_at is not None:
+        # 幻听语速闸（句级）：时长必须归属产出本句 delta 的 utterance。
+        # 连续叙述实锤（zh-monologue，2026-07-31）：服务端把整段 16s 的
+        # 转写 delta 憋到下一个 utterance 已 speech_started 之后才吐出，
+        # 若拿"当前起点"算语速，会把真话判成 0.1s 内蹦出 60 字的幻听、
+        # 整段静音。_speech_durations 与 completed 的弹出同为 FIFO，
+        # 队头即本批 delta 所属 utterance 的真实语音时长；队列空才说明
+        # delta 属于仍在进行的当前 utterance，此时才允许用当前起点。
+        duration: float | None = None
+        if self._speech_durations:
+            duration = self._speech_durations[0]
+        elif self._speech_started_at is not None:
             duration = time.monotonic() - self._speech_started_at
-            if self._looks_like_hallucination(text, duration):
-                print(
-                    f"[cascade] 疑似幻听（语速异常），已忽略：{text[:48]}",
-                    flush=True,
-                )
-                return
+        if duration is not None and self._looks_like_hallucination(
+            text, duration
+        ):
+            print(
+                f"[cascade] 疑似幻听（语速异常），已忽略：{text[:48]}",
+                flush=True,
+            )
+            return
         if self._is_self_echo(text):
             print(
                 f"[cascade] 疑似自回声，已忽略：{text[:48]}",

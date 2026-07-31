@@ -699,6 +699,62 @@ class CascadeNoiseGateTests(unittest.IsolatedAsyncioTestCase):
         await client.stop()
         await task
 
+    async def test_delayed_delta_burst_is_not_killed_as_hallucination(
+        self,
+    ) -> None:
+        # zh-monologue 实锤（2026-07-31）：连续叙述 16s 不停顿时，服务端
+        # 把整段转写 delta 憋到下一个 utterance 已 speech_started 之后
+        # 才一口气吐出。语速闸若拿"当前起点"（刚 0.1s）去算 60 字，
+        # 三句真话全被判幻听静音。规格：时长取 _speech_durations 队头
+        # （本批 delta 所属 utterance 的真实语音时长）。
+        server = MockRealtimeServer(_transcription_script([]))
+        tts = _FakeTtsSession([])
+        calls: list = []
+        client, _, _ = self._make(
+            server, tts, _fake_translator_factory([], calls)
+        )
+        task = client.start()
+        # utterance 1 的语音时长已被 speech_stopped 记账（16.4s 长叙述）
+        client._speech_durations.append(16.4)
+        # 下一个 utterance 已经开始（时长几乎为零）
+        client.handle_server_event(
+            {"type": "input_audio_buffer.speech_started"}
+        )
+        # 此刻 utterance 1 的 delta 才爆发：三句共 ~50 字
+        client.handle_server_event({
+            "type": "conversation.item.input_audio_transcription.delta",
+            "delta": (
+                "大家好，今天我会报一下项目进度。"
+                "目前的进度基本符合预期，但有两个风险点需要注意。"
+                "第一批设备预计8月15号发货。"
+            ),
+        })
+        self.assertEqual(client._translation_queue.qsize(), 3)
+        await client.stop()
+        await task
+
+    async def test_inflight_delta_hallucination_is_still_dropped(self) -> None:
+        # 语速闸的本职不因归因修正而松动：没有已记账的 utterance 时长
+        # （队列空）、当前 utterance 刚开始 0.1s 就蹦出整句长文本，
+        # 仍是静默期幻听，照丢。
+        server = MockRealtimeServer(_transcription_script([]))
+        tts = _FakeTtsSession([])
+        calls: list = []
+        client, _, _ = self._make(
+            server, tts, _fake_translator_factory([], calls)
+        )
+        task = client.start()
+        client.handle_server_event(
+            {"type": "input_audio_buffer.speech_started"}
+        )
+        client.handle_server_event({
+            "type": "conversation.item.input_audio_transcription.delta",
+            "delta": "貴社のご要望を理解いたしました。",
+        })
+        self.assertTrue(client._translation_queue.empty())
+        await client.stop()
+        await task
+
 
 class CascadeWorkerSurvivalTests(unittest.IsolatedAsyncioTestCase):
     async def test_hanging_translation_does_not_kill_worker(self) -> None:
