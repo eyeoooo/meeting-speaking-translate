@@ -112,7 +112,10 @@ class CascadeConstructionTests(unittest.TestCase):
         # 真人复验红线：半句/片段绝不补全（曾把「納品」补成
         # 「納品いたします」）；译文数字阿拉伯表记（TTS 朗读稳定）。
         self.assertIn("绝不替说话人补全句子", system)
-        self.assertIn("阿拉伯数字表记", system)
+        # 数字表记决定朗读语言（机器耳朵实测）：纯汉字串被中文朗读、
+        # 裸连写被乱读，顿号分隔的阿拉伯数字才是日语逐位读法。
+        self.assertIn("1、2、3、4、5", system)
+        self.assertIn("绝不写「一二三四五」", system)
         user = build_translation_user(
             [("你好。", "こんにちは。")], "第七批设备"
         )
