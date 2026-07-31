@@ -1,0 +1,10 @@
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.26
+scipy>=1.11
+anthropic>=0.90
+httpx>=0.27
+aiohttp>=3.9
+# STT 后端二选一（Apple Silicon 推荐 mlx-whisper）：
+#   pip install mlx-whisper
+#   pip install faster-whisper

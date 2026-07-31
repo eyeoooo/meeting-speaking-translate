@@ -1,0 +1,2 @@
+# 图标与打包中间产物：全部可由 make-icon.swift / build-apps.sh 重现，不入库
+build/
