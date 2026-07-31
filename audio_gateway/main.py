@@ -509,13 +509,14 @@ def cmd_bridge(args) -> int:
             return 2
     elevenlabs_api_key = ""
     clone_voice_id = ""
-    if getattr(args, "speak_engine", "translate") == "clone":
+    speak_engine = getattr(args, "speak_engine", "translate")
+    if speak_engine in ("clone", "cascade"):
         elevenlabs_api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
         if not elevenlabs_api_key:
             print(
-                "[bridge] --speak-engine clone 启动已 fail-closed：未设置 "
-                "ELEVENLABS_API_KEY。请先在 Mac mini 的 ~/.zshenv 写入 "
-                "`export ELEVENLABS_API_KEY=...` 后重试。"
+                f"[bridge] --speak-engine {speak_engine} 启动已 fail-closed："
+                "未设置 ELEVENLABS_API_KEY。请先在 Mac mini 的 ~/.zshenv "
+                "写入 `export ELEVENLABS_API_KEY=...` 后重试。"
             )
             return 2
         clone_voice_id = (
@@ -524,13 +525,22 @@ def cmd_bridge(args) -> int:
         )
         if not clone_voice_id:
             print(
-                "[bridge] --speak-engine clone 启动已 fail-closed：未指定"
-                "克隆声线。请传 --speak-voice-id，或在 ~/.zshenv 写入 "
+                f"[bridge] --speak-engine {speak_engine} 启动已 fail-closed："
+                "未指定克隆声线。请传 --speak-voice-id，或在 ~/.zshenv 写入 "
                 "`export ELEVENLABS_VOICE_ID=...`（在 ElevenLabs 完成"
                 "声音克隆后可获得 voice id）。"
             )
             return 2
     anthropic_api_key = ""
+    if speak_engine == "cascade":
+        anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not anthropic_api_key:
+            print(
+                "[bridge] --speak-engine cascade 启动已 fail-closed：未设置 "
+                "ANTHROPIC_API_KEY（级联翻译需要）。请先在 Mac mini 的 "
+                "~/.zshenv 配置后重试。"
+            )
+            return 2
     if args.advise:
         anthropic_api_key = os.environ.get(
             "ANTHROPIC_API_KEY",
@@ -612,11 +622,13 @@ def cmd_bridge(args) -> int:
                       rehearse_replay=getattr(args, "rehearse_replay", None),
                       speak=getattr(args, "speak", False),
                       speak_device=speak_device,
-                      speak_engine=getattr(args, "speak_engine", "translate"),
+                      speak_engine=speak_engine,
                       elevenlabs_api_key=elevenlabs_api_key,
                       clone_voice_id=clone_voice_id,
                       clone_model=getattr(args, "clone_model", None),
-                      clone_speed=getattr(args, "clone_speed", None))
+                      clone_speed=getattr(args, "clone_speed", None),
+                      cascade_translate_model=getattr(
+                          args, "cascade_translate_model", None))
 
 
 def cmd_micagent(args) -> int:
@@ -732,12 +744,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument(
         "--speak-engine",
-        choices=["translate", "expressive", "clone"],
+        choices=["translate", "expressive", "clone", "cascade"],
         default="translate",
         help="发言引擎：translate=translations 端点（默认，正确性优先）；"
-        "expressive=通用 Realtime GA + marin 声线（A/B 评测中的表现力候选）；"
+        "expressive=通用 Realtime GA + marin 声线（真人复验红线，不转正）；"
         "clone=translate 文本链路 + ElevenLabs 克隆声线（M3，"
-        "需 ELEVENLABS_API_KEY 与 --speak-voice-id）",
+        "需 ELEVENLABS_API_KEY 与 --speak-voice-id）；"
+        "cascade=自建 ASR+Claude 翻译+克隆声线（升级路径，另需 "
+        "ANTHROPIC_API_KEY）",
+    )
+    b.add_argument(
+        "--cascade-translate-model",
+        default=None,
+        help="cascade 引擎的翻译模型（默认 claude-haiku-4-5，延迟优先）",
     )
     b.add_argument(
         "--speak-voice-id",

@@ -27,7 +27,7 @@ import wave
 from datetime import datetime
 from pathlib import Path
 
-ENGINES = ("translate", "expressive", "clone")
+ENGINES = ("translate", "expressive", "clone", "cascade")
 
 
 def wav_duration_seconds(path: Path) -> float:

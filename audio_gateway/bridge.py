@@ -189,6 +189,23 @@ class SegmentHistory:
         return merged
 
 
+def _load_cascade_glossary() -> str:
+    """级联的热词/术语来源：与参谋同一份 brief（用户已有维护习惯）。
+
+    只取前 2000 字符——ASR prompt 与翻译 system 都不适合塞长文；
+    缺文件即空串，术语表是增强不是启动前提。
+    """
+    from pathlib import Path
+
+    try:
+        text = (
+            Path.home() / "AudioGateway" / "brief.md"
+        ).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return text.strip()[:2000]
+
+
 def draft_broadcast_payload(stream: str, text: str, epoch: int) -> dict[str, Any]:
     """字幕草稿（未成句的灰字中间态）的 WS 消息，与 segment 是两种东西。
 
@@ -1177,18 +1194,27 @@ def run_bridge(
     clone_voice_id: str = "",
     clone_model: str | None = None,
     clone_speed: float | None = None,
+    cascade_translate_model: str | None = None,
 ) -> int:
     # 发言引擎白名单在一切资源分配之前判定：错误引擎名是配置事故，
     # 绝不能静默回退到任何一个引擎（回退=用户以为在 A/B 其实在 A/A）。
-    if speak_engine not in {"translate", "expressive", "clone"}:
+    if speak_engine not in {"translate", "expressive", "clone", "cascade"}:
         raise ValueError(
             f"unknown speak engine: {speak_engine!r} "
-            "(expected 'translate', 'expressive' or 'clone')"
+            "(expected 'translate', 'expressive', 'clone' or 'cascade')"
         )
-    if speak_engine == "clone" and not elevenlabs_api_key.strip():
-        raise ValueError("clone speak engine requires ELEVENLABS_API_KEY")
-    if speak_engine == "clone" and not clone_voice_id.strip():
-        raise ValueError("clone speak engine requires a voice id")
+    # clone 与 cascade 共用克隆声线出口，凭据要求一致。
+    if speak_engine in {"clone", "cascade"}:
+        if not elevenlabs_api_key.strip():
+            raise ValueError(
+                f"{speak_engine} speak engine requires ELEVENLABS_API_KEY"
+            )
+        if not clone_voice_id.strip():
+            raise ValueError(
+                f"{speak_engine} speak engine requires a voice id"
+            )
+    if speak_engine == "cascade" and not anthropic_api_key.strip():
+        raise ValueError("cascade speak engine requires ANTHROPIC_API_KEY")
     if interpret and not openai_api_key.strip():
         raise ValueError("interpret requires OPENAI_API_KEY")
     if interpret and interpret_device is None:
@@ -1630,6 +1656,41 @@ def run_bridge(
                     player,
                     api_key=openai_api_key,
                     lang="ja",
+                    state=rehearsal_state,
+                    on_state=on_rehearsal_state,
+                    on_sentence=on_rehearsal_segment,
+                    vad_dbfs=interpret_vad_dbfs,
+                )
+            elif speak_engine == "cascade":
+                # 分句级联（升级路径落地）：自建 ASR（热词）→ Claude 翻译
+                # （术语表+滚动上下文）→ 克隆 TTS 出口不变。详见 cascade.py。
+                from .cascade import (
+                    DEFAULT_CASCADE_TRANSLATE_MODEL,
+                    CascadeSpeechSession,
+                )
+                from .voiceclone import (
+                    DEFAULT_CLONE_MODEL as _CLONE_MODEL,
+                    DEFAULT_CLONE_SPEED as _CLONE_SPEED,
+                )
+
+                rehearsal = CascadeSpeechSession(
+                    rehearsal_tap,
+                    player,
+                    api_key=openai_api_key,
+                    anthropic_api_key=anthropic_api_key,
+                    elevenlabs_api_key=elevenlabs_api_key,
+                    voice_id=clone_voice_id,
+                    clone_model=clone_model or _CLONE_MODEL,
+                    clone_speed=(
+                        clone_speed
+                        if clone_speed is not None
+                        else _CLONE_SPEED
+                    ),
+                    translate_model=(
+                        cascade_translate_model
+                        or DEFAULT_CASCADE_TRANSLATE_MODEL
+                    ),
+                    glossary=_load_cascade_glossary(),
                     state=rehearsal_state,
                     on_state=on_rehearsal_state,
                     on_sentence=on_rehearsal_segment,

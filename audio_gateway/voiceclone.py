@@ -1,15 +1,19 @@
 """M3 声纹克隆：translate 文本链路 + ElevenLabs 跨语言克隆声线。
 
-正确性优先裁定（translate 引擎保持默认）不受影响：本类继承
-RealtimeInterpreter，translations 端点、断句、重连、VAD、语音开关全部
-逐字复用（父类一行未动）；替换的只有音频出口——端点内置声线的
+正确性优先裁定（translate 引擎保持默认）不受影响：CloneSpeechSession
+继承 RealtimeInterpreter，translations 端点、断句、重连、VAD、语音开关
+全部逐字复用（父类一行未动）；替换的只有音频出口——端点内置声线的
 audio delta 被丢弃，改由译文成句驱动 ElevenLabs 跨语言 TTS（用户本人
 的克隆声线），出口仍是 player.feed_pcm16(24kHz mono PCM16)，
 SpeakTeePlayer 的静音门控/双支路/收尾栅栏自动继承。
 
+ElevenLabs 出口本体抽成 ElevenLabsSpeaker：cascade 引擎（分句级联，
+见 cascade.py）复用同一出口——"换文本来源不换声音"是 M3 的裁定，
+声线参数（turbo_v2_5 + speed1.1 + stability0.8 + 90Hz 高通）是用户
+两轮听感终审的定稿，只此一份。
+
 为什么按"成句"而不是逐字流式喂 TTS：克隆声线的韵律需要整句上下文，
 且成句是本产品既有的稳定单元（SentenceAccumulator 兜底 160 字/15 秒）。
-文字 delta 比端点内置语音先到，成句 TTS 首音与内置声线同量级。
 
 失败语义：单句合成失败=该句静音（文本仍在面板与 rehearsal.jsonl 里），
 报告错误后继续下一句——发言中途绝不因 TTS 抖动整场翻车。
@@ -38,7 +42,7 @@ DEFAULT_CLONE_STABILITY = 0.8
 DEFAULT_CLONE_SIMILARITY_BOOST = 0.75
 # 喷麦（爆破音"噗"声）能量集中在 100Hz 以下、人声基频之上无内容；
 # 90Hz 二阶高通是录音行业标准除喷麦手段。2026-07-31 用户听感裁决
-# （e 版"最干净、音色也没变"）钉为 clone 引擎固定出口处理。
+# （e 版"最干净、音色也没变"）钉为克隆出口固定处理。
 CLONE_HIGHPASS_HZ = 90.0
 _HIGHPASS_SOS = sp_signal.butter(
     2,
@@ -47,6 +51,20 @@ _HIGHPASS_SOS = sp_signal.butter(
     fs=24_000,
     output="sos",
 )
+ELEVENLABS_TTS_URL = (
+    "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+)
+# 预热用只读端点：建 TLS/HTTP 连接不产生合成计费。
+ELEVENLABS_VOICE_URL = "https://api.elevenlabs.io/v1/voices/{voice_id}"
+# 直接请求 24k PCM 对齐 feed_pcm16 契约（24kHz mono PCM16 LE），
+# 不做任何本地重采样——收听侧共用播放器类，契约绝不动。
+CLONE_OUTPUT_FORMAT = "pcm_24000"
+# ElevenLabs voice_settings.speed 的合法区间（官方文档 0.7–1.2）；
+# None=不发 voice_settings，用声线自带默认语速。
+CLONE_SPEED_MIN = 0.7
+CLONE_SPEED_MAX = 1.2
+# 单句合成的总超时：超时=该句静音并继续，绝不悬挂工作者。
+TTS_SENTENCE_TIMEOUT_SECONDS = 30.0
 
 
 class _SentenceHighpass:
@@ -64,20 +82,148 @@ class _SentenceHighpass:
             _HIGHPASS_SOS, samples, zi=self._zi
         )
         return np.clip(filtered, -32768, 32767).astype("<i2").tobytes()
-# ElevenLabs voice_settings.speed 的合法区间（官方文档 0.7–1.2）；
-# None=不发该字段，用声线自带默认语速。
-CLONE_SPEED_MIN = 0.7
-CLONE_SPEED_MAX = 1.2
-ELEVENLABS_TTS_URL = (
-    "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
-)
-# 预热用只读端点：建 TLS/HTTP 连接不产生合成计费。
-ELEVENLABS_VOICE_URL = "https://api.elevenlabs.io/v1/voices/{voice_id}"
-# 直接请求 24k PCM 对齐 feed_pcm16 契约（24kHz mono PCM16 LE），
-# 不做任何本地重采样——收听侧共用播放器类，契约绝不动。
-CLONE_OUTPUT_FORMAT = "pcm_24000"
-# 单句合成的总超时：超时=该句静音并继续，绝不悬挂工作者。
-TTS_SENTENCE_TIMEOUT_SECONDS = 30.0
+
+
+class ElevenLabsSpeaker:
+    """译文成句 → ElevenLabs 流式合成 → feed_pcm16 的可复用出口。
+
+    单工作者串行合成：句序即播放序，天然无乱序。工作者随会话启动
+    （冷连接握手实测多付 ~1.5s，预热必须发生在用户开口之前）。
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        voice_id: str,
+        model: str,
+        speed: float | None,
+        output_player: Any,
+        is_enabled: Callable[[], bool],
+        report_error: Callable[[str], None],
+        session_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        if not api_key.strip():
+            raise ValueError(
+                "ELEVENLABS_API_KEY is required for clone speak engine"
+            )
+        if not voice_id.strip():
+            raise ValueError("clone voice id must be non-empty")
+        if speed is not None and not (
+            CLONE_SPEED_MIN <= speed <= CLONE_SPEED_MAX
+        ):
+            raise ValueError(
+                f"clone speed must be within [{CLONE_SPEED_MIN}, "
+                f"{CLONE_SPEED_MAX}], got {speed}"
+            )
+        self._api_key = api_key.strip()
+        self._voice_id = voice_id.strip()
+        self._model = model
+        self._speed = speed
+        self._output_player = output_player
+        self._is_enabled = is_enabled
+        self._report_error = report_error
+        self._session_factory = session_factory or (
+            lambda: aiohttp.ClientSession()
+        )
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def voice_id(self) -> str:
+        return self._voice_id
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._task is None or self._task.done():
+            self._task = loop.create_task(self._worker(), name="clone-tts")
+
+    def ensure_started(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.get_running_loop().create_task(
+                self._worker(),
+                name="clone-tts",
+            )
+
+    def enqueue(self, sentence: str) -> None:
+        self._queue.put_nowait(sentence)
+
+    async def stop(self) -> None:
+        task = self._task
+        self._task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _warm_up(self, session: Any) -> None:
+        # 失败静默：预热是延迟优化，不是发言的前提条件。
+        try:
+            async with session.get(
+                ELEVENLABS_VOICE_URL.format(voice_id=self._voice_id),
+                headers={"xi-api-key": self._api_key},
+            ) as response:
+                await response.read()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def _worker(self) -> None:
+        async with self._session_factory() as session:
+            await self._warm_up(session)
+            while True:
+                sentence = await self._queue.get()
+                try:
+                    await asyncio.wait_for(
+                        self._synthesize(session, sentence),
+                        TTS_SENTENCE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._report_error(
+                        f"克隆语音合成失败，该句静音（字幕不受影响）：{exc}"
+                    )
+
+    async def _synthesize(self, session: Any, sentence: str) -> None:
+        # 语音关闭/播放器未启动时不合成（也省下这句的 ElevenLabs 计费）。
+        if not self._is_enabled():
+            return
+        body: dict[str, Any] = {
+            "text": sentence,
+            "model_id": self._model,
+        }
+        if self._speed is not None:
+            body["voice_settings"] = {
+                "speed": self._speed,
+                "stability": DEFAULT_CLONE_STABILITY,
+                "similarity_boost": DEFAULT_CLONE_SIMILARITY_BOOST,
+            }
+        async with session.post(
+            ELEVENLABS_TTS_URL.format(voice_id=self._voice_id),
+            params={"output_format": CLONE_OUTPUT_FORMAT},
+            headers={"xi-api-key": self._api_key},
+            json=body,
+        ) as response:
+            if response.status != 200:
+                detail = (await response.text())[:200]
+                raise RuntimeError(
+                    f"ElevenLabs HTTP {response.status}: {detail}"
+                )
+            # 裸 PCM16 流的块边界可能落在奇数字节上；攒住尾字节，
+            # 保证 feed_pcm16 恒收偶数长度（其契约会对奇数长度抛错）。
+            highpass = _SentenceHighpass()
+            carry = b""
+            async for chunk in response.content.iter_chunked(4096):
+                data = carry + chunk
+                if len(data) % 2:
+                    carry, data = data[-1:], data[:-1]
+                else:
+                    carry = b""
+                if data:
+                    self._output_player.feed_pcm16(highpass.process(data))
 
 
 class CloneSpeechSession(RealtimeInterpreter):
@@ -100,33 +246,33 @@ class CloneSpeechSession(RealtimeInterpreter):
         tts_session_factory: Callable[[], Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        if not elevenlabs_api_key.strip():
-            raise ValueError(
-                "ELEVENLABS_API_KEY is required for clone speak engine"
-            )
-        if not voice_id.strip():
-            raise ValueError("clone voice id must be non-empty")
-        if clone_speed is not None and not (
-            CLONE_SPEED_MIN <= clone_speed <= CLONE_SPEED_MAX
-        ):
-            raise ValueError(
-                f"clone speed must be within [{CLONE_SPEED_MIN}, "
-                f"{CLONE_SPEED_MAX}], got {clone_speed}"
-            )
         super().__init__(audio_tap, output_player, api_key=api_key, **kwargs)
-        self._el_api_key = elevenlabs_api_key.strip()
-        self._voice_id = voice_id.strip()
-        self._clone_model = clone_model
-        self._clone_speed = clone_speed
-        self._tts_session_factory = tts_session_factory or (
-            lambda: aiohttp.ClientSession()
+        self._speaker = ElevenLabsSpeaker(
+            api_key=elevenlabs_api_key,
+            voice_id=voice_id,
+            model=clone_model,
+            speed=clone_speed,
+            output_player=output_player,
+            is_enabled=lambda: (
+                self.state.snapshot()["interpret_voice"]
+                and self._player_started
+            ),
+            report_error=self._report_error,
+            session_factory=tts_session_factory,
         )
-        self._tts_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._tts_task: asyncio.Task[None] | None = None
 
     @property
     def voice_id(self) -> str:
-        return self._voice_id
+        return self._speaker.voice_id
+
+    def start(
+        self,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> asyncio.Task[None]:
+        task = super().start(loop)
+        # 工作者随会话启动而不是首句才启动：预热要赶在用户开口之前。
+        self._speaker.start(loop or asyncio.get_running_loop())
+        return task
 
     def handle_server_event(self, event: dict[str, Any]) -> bool:
         if event.get("type") == "session.output_audio.delta":
@@ -150,103 +296,8 @@ class CloneSpeechSession(RealtimeInterpreter):
         if self._stop_event.is_set():
             return
         # 入队即返回：TTS 网络 IO 绝不阻塞协议解析循环。
-        self._ensure_tts_worker()
-        self._tts_queue.put_nowait(sentence)
-
-    def start(
-        self,
-        loop: asyncio.AbstractEventLoop | None = None,
-    ) -> asyncio.Task[None]:
-        task = super().start(loop)
-        # 工作者随会话启动而不是首句才启动：TTS 冷连接握手实测多付
-        # ~1.5s，预热必须发生在用户开口之前才有意义。
-        if self._tts_task is None or self._tts_task.done():
-            selected_loop = loop or asyncio.get_running_loop()
-            self._tts_task = selected_loop.create_task(
-                self._tts_worker(),
-                name="clone-tts",
-            )
-        return task
-
-    def _ensure_tts_worker(self) -> None:
-        if self._tts_task is None or self._tts_task.done():
-            self._tts_task = asyncio.get_running_loop().create_task(
-                self._tts_worker(),
-                name="clone-tts",
-            )
-
-    async def _warm_up(self, session: Any) -> None:
-        # 失败静默：预热是延迟优化，不是发言的前提条件。
-        try:
-            async with session.get(
-                ELEVENLABS_VOICE_URL.format(voice_id=self._voice_id),
-                headers={"xi-api-key": self._el_api_key},
-            ) as response:
-                await response.read()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-
-    async def _tts_worker(self) -> None:
-        # 单工作者串行合成：句序即播放序，天然无乱序。
-        async with self._tts_session_factory() as session:
-            await self._warm_up(session)
-            while True:
-                sentence = await self._tts_queue.get()
-                try:
-                    await asyncio.wait_for(
-                        self._synthesize(session, sentence),
-                        TTS_SENTENCE_TIMEOUT_SECONDS,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._report_error(
-                        f"克隆语音合成失败，该句静音（字幕不受影响）：{exc}"
-                    )
-
-    async def _synthesize(self, session: Any, sentence: str) -> None:
-        # 与父类音频 delta 同一道门：语音关闭/播放器未启动时不合成
-        # （也省下这句的 ElevenLabs 计费）。
-        if (
-            not self.state.snapshot()["interpret_voice"]
-            or not self._player_started
-        ):
-            return
-        body: dict[str, Any] = {
-            "text": sentence,
-            "model_id": self._clone_model,
-        }
-        if self._clone_speed is not None:
-            body["voice_settings"] = {
-                "speed": self._clone_speed,
-                "stability": DEFAULT_CLONE_STABILITY,
-                "similarity_boost": DEFAULT_CLONE_SIMILARITY_BOOST,
-            }
-        async with session.post(
-            ELEVENLABS_TTS_URL.format(voice_id=self._voice_id),
-            params={"output_format": CLONE_OUTPUT_FORMAT},
-            headers={"xi-api-key": self._el_api_key},
-            json=body,
-        ) as response:
-            if response.status != 200:
-                detail = (await response.text())[:200]
-                raise RuntimeError(
-                    f"ElevenLabs HTTP {response.status}: {detail}"
-                )
-            # 裸 PCM16 流的块边界可能落在奇数字节上；攒住尾字节，
-            # 保证 feed_pcm16 恒收偶数长度（其契约会对奇数长度抛错）。
-            highpass = _SentenceHighpass()
-            carry = b""
-            async for chunk in response.content.iter_chunked(4096):
-                data = carry + chunk
-                if len(data) % 2:
-                    carry, data = data[-1:], data[:-1]
-                else:
-                    carry = b""
-                if data:
-                    self._output_player.feed_pcm16(highpass.process(data))
+        self._speaker.ensure_started()
+        self._speaker.enqueue(sentence)
 
     async def stop(self) -> None:
         # 会议结束即停声：残句文本仍会被父类 _flush_text 发布到面板，
@@ -254,12 +305,5 @@ class CloneSpeechSession(RealtimeInterpreter):
         # 先置停止位再取消工作者：反过来会留一条竞态窗口，在途 segment
         # 能把刚取消的工作者重新拉起来。
         self._stop_event.set()
-        task = self._tts_task
-        self._tts_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        await self._speaker.stop()
         await super().stop()
