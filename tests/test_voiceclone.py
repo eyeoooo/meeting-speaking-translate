@@ -63,6 +63,9 @@ class _FakeTtsResponse:
     async def text(self) -> str:
         return self._detail
 
+    async def read(self) -> bytes:
+        return b""
+
     async def iter_chunked(self, size: int):
         for chunk in self._chunks:
             yield chunk
@@ -73,6 +76,7 @@ class _FakeTtsSession:
 
     def __init__(self, script: list[_FakeTtsResponse]) -> None:
         self.requests: list[dict] = []
+        self.warmups: list[str] = []
         self._script = list(script)
         self.closed = False
 
@@ -81,6 +85,10 @@ class _FakeTtsSession:
 
     async def __aexit__(self, *exc: object) -> None:
         self.closed = True
+
+    def get(self, url, *, headers=None):
+        self.warmups.append(url)
+        return _FakeTtsResponse()
 
     def post(self, url, *, params=None, headers=None, json=None):
         self.requests.append({
@@ -401,6 +409,24 @@ class CloneProtocolTests(unittest.IsolatedAsyncioTestCase):
             any("克隆语音合成失败" in message for message in errors),
             errors,
         )
+
+    async def test_connection_warms_up_at_start_before_any_sentence(
+        self,
+    ) -> None:
+        # 冷连接握手实测多付 ~1.5s：预热必须随会话启动发生，而不是
+        # 等首句到达；且预热绝不触发任何合成计费（POST）。
+        server = MockRealtimeServer(_translations_script([]))
+        tts = _FakeTtsSession([])
+        client, output, _ = self._make_client(server, tts)
+
+        task = client.start()
+        await _wait_until(lambda: len(tts.warmups) >= 1)
+        await client.stop()
+        await task
+
+        self.assertIn("voice-clone-1", tts.warmups[0])
+        self.assertEqual([], tts.requests)
+        self.assertEqual([], output.chunks)
 
     async def test_voice_disabled_synthesizes_nothing(self) -> None:
         events = [

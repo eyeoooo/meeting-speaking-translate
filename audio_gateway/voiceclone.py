@@ -71,6 +71,8 @@ CLONE_SPEED_MAX = 1.2
 ELEVENLABS_TTS_URL = (
     "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
 )
+# 预热用只读端点：建 TLS/HTTP 连接不产生合成计费。
+ELEVENLABS_VOICE_URL = "https://api.elevenlabs.io/v1/voices/{voice_id}"
 # 直接请求 24k PCM 对齐 feed_pcm16 契约（24kHz mono PCM16 LE），
 # 不做任何本地重采样——收听侧共用播放器类，契约绝不动。
 CLONE_OUTPUT_FORMAT = "pcm_24000"
@@ -151,6 +153,21 @@ class CloneSpeechSession(RealtimeInterpreter):
         self._ensure_tts_worker()
         self._tts_queue.put_nowait(sentence)
 
+    def start(
+        self,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> asyncio.Task[None]:
+        task = super().start(loop)
+        # 工作者随会话启动而不是首句才启动：TTS 冷连接握手实测多付
+        # ~1.5s，预热必须发生在用户开口之前才有意义。
+        if self._tts_task is None or self._tts_task.done():
+            selected_loop = loop or asyncio.get_running_loop()
+            self._tts_task = selected_loop.create_task(
+                self._tts_worker(),
+                name="clone-tts",
+            )
+        return task
+
     def _ensure_tts_worker(self) -> None:
         if self._tts_task is None or self._tts_task.done():
             self._tts_task = asyncio.get_running_loop().create_task(
@@ -158,9 +175,23 @@ class CloneSpeechSession(RealtimeInterpreter):
                 name="clone-tts",
             )
 
+    async def _warm_up(self, session: Any) -> None:
+        # 失败静默：预热是延迟优化，不是发言的前提条件。
+        try:
+            async with session.get(
+                ELEVENLABS_VOICE_URL.format(voice_id=self._voice_id),
+                headers={"xi-api-key": self._el_api_key},
+            ) as response:
+                await response.read()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
     async def _tts_worker(self) -> None:
         # 单工作者串行合成：句序即播放序，天然无乱序。
         async with self._tts_session_factory() as session:
+            await self._warm_up(session)
             while True:
                 sentence = await self._tts_queue.get()
                 try:
