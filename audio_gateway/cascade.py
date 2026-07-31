@@ -339,6 +339,9 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         # 幻听语速闸的分母。completed 与 stopped 一一对应地出队。
         self._speech_started_at: float | None = None
         self._speech_durations: deque[float] = deque(maxlen=8)
+        # 本 utterance 已到达的 delta 累计：completed 时判定走哪条路——
+        # 有 delta（正常）只冲刷残句；无 delta（测试/降级）整句回灌。
+        self._utterance_delta_text = ""
 
     @property
     def system_prompt(self) -> str:
@@ -383,8 +386,14 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                 self._speech_started_at = None
             return False
         if event_type == "conversation.item.input_audio_transcription.delta":
-            # 面板显示走既有断句链（含草稿语义）；翻译不用 delta。
-            self._consume_text_delta("source", event.get("delta"), None)
+            # 句读级触发（2026-07-31 延迟裁定）：delta 实时到达，成句
+            # 即通过 _publish_segment("source") 钩子送翻译——不等 VAD
+            # 停顿判定与 completed 定稿。长段叙述里第一句在说第二句时
+            # 已在翻译；单句省掉整个 VAD 尾巴（~0.6-0.9s）。
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                self._utterance_delta_text += delta
+            self._consume_text_delta("source", delta, None)
             return False
         if (
             event_type
@@ -393,12 +402,20 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
             # completed 全文与 delta 流重复，绝不再 feed；只用换行冲刷
             # 面板残句（expressive 同款手法）。翻译取 completed 全文——
             # utterance 级整句是翻译质量的最小单元。
-            self._consume_text_delta("source", "\n", None)
             duration = (
                 self._speech_durations.popleft()
                 if self._speech_durations
                 else None
             )
+            had_deltas = bool(self._utterance_delta_text.strip())
+            self._utterance_delta_text = ""
+            if had_deltas:
+                # 正常路：句子已随 delta 逐句送翻译，这里只冲刷残句
+                # （completed 全文与 delta 流重复，绝不再 feed）。
+                self._consume_text_delta("source", "\n", None)
+                return False
+            # 降级路（无 delta 只有 completed）：整句回灌显示与翻译，
+            # utterance 级幻听语速闸在此把关。
             transcript = event.get("transcript")
             if isinstance(transcript, str) and transcript.strip():
                 text = transcript.strip()
@@ -407,14 +424,8 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                         f"[cascade] 疑似幻听（语速异常），已忽略：{text[:48]}",
                         flush=True,
                     )
-                elif self._is_self_echo(text):
-                    # 回环不进翻译、不出声；打进日志供事后归因。
-                    print(
-                        f"[cascade] 疑似自回声，已忽略：{text[:48]}",
-                        flush=True,
-                    )
                 else:
-                    self._enqueue_translation(text)
+                    self._consume_text_delta("source", text + "\n", None)
             return False
         if event_type == "error":
             import json as _json
@@ -607,6 +618,29 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
                 return True
         return False
 
+    def _ingest_source_sentence(self, sentence: str) -> None:
+        """源句成句即入翻译管线（delta 触发或冲刷触发，同一入口）。"""
+        text = sentence.strip()
+        if not text or self._stop_event.is_set():
+            return
+        # 幻听语速闸（句级）：从本 utterance 语音起点累计。语音已停
+        # （冲刷残句）时无起点可算，由 completed 降级路的闸兜底。
+        if self._speech_started_at is not None:
+            duration = time.monotonic() - self._speech_started_at
+            if self._looks_like_hallucination(text, duration):
+                print(
+                    f"[cascade] 疑似幻听（语速异常），已忽略：{text[:48]}",
+                    flush=True,
+                )
+                return
+        if self._is_self_echo(text):
+            print(
+                f"[cascade] 疑似自回声，已忽略：{text[:48]}",
+                flush=True,
+            )
+            return
+        self._enqueue_translation(text)
+
     def _publish_segment(
         self,
         kind: str,
@@ -614,6 +648,11 @@ class CascadeSpeechSession(ExpressiveSpeechSession):
         elapsed_ms: int | None,
     ) -> None:
         super()._publish_segment(kind, sentence, elapsed_ms)
+        if kind == "source":
+            # 句读级触发：源句一成句（无论来自 delta 还是冲刷）立即
+            # 进翻译管线，不等 utterance 结束。
+            self._ingest_source_sentence(sentence)
+            return
         if kind != "translation" or self._stop_event.is_set():
             return
         # 先记账再发声：说出去的每句话都是自回声判定的比对集。

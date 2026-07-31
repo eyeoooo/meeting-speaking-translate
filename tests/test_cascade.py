@@ -262,14 +262,17 @@ class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
         await client.stop()
         await task
 
-        # 文本链路：source 由 completed 换行冲刷成句，译文逐句发布。
+        # 文本链路：两条源句都上屏（降级路整句回灌——修了无 delta
+        # 语句在说泳道隐形的旧缺陷），译文逐句发布；源↔译发布顺序
+        # 因翻译异步不定，断言集合与各自流内顺序。
+        published = [(s.stream, s.text) for s in segments]
         self.assertEqual(
-            [
-                ("source", "我们下周交付三百台"),
-                ("translation", "来週300台納品します。"),
-                ("translation", "価格は5%を超えません。"),
-            ],
-            [(s.stream, s.text) for s in segments],
+            ["我们下周交付三百台", "价格不超过百分之五"],
+            [text for stream, text in published if stream == "source"],
+        )
+        self.assertEqual(
+            ["来週300台納品します。", "価格は5%を超えません。"],
+            [text for stream, text in published if stream == "translation"],
         )
         # TTS 收到的就是译文成句，按句序。
         self.assertEqual(
@@ -379,6 +382,47 @@ class CascadeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("已忽略" in message for message in errors), errors
         )
+
+    async def test_delta_sentence_translates_before_completed(self) -> None:
+        # 句读级触发：delta 流里句子一成句（。）立即送翻译，不等
+        # utterance completed——这是省掉 VAD 尾巴与长段积压的关键。
+        events = [
+            {
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "一文目です。二文目",
+            },
+            # 刻意不发 completed：首句必须仅凭 delta 就出声
+        ]
+        server = MockRealtimeServer(_transcription_script(events))
+        tts = _FakeTtsSession([
+            _FakeTtsResponse(chunks=(CLONE_PCM,)),
+            _FakeTtsResponse(chunks=(CLONE_PCM,)),
+        ])
+        calls: list = []
+        translator = _fake_translator_factory(
+            ["一文目です。", "二文目"], calls
+        )
+        client, output, _ = self._make_client(server, tts, translator)
+
+        task = client.start()
+        await _wait_until(lambda: len(tts.requests) >= 1)
+        # 首句已出声，completed 尚未到达
+        self.assertEqual(
+            "一文目です。", tts.requests[0]["json"]["text"]
+        )
+        # completed 到达：只冲残句，绝不重复整句
+        client.handle_server_event({
+            "type": (
+                "conversation.item.input_audio_transcription.completed"
+            ),
+            "transcript": "一文目です。二文目",
+        })
+        await _wait_until(lambda: len(tts.requests) >= 2)
+        await client.stop()
+        await task
+
+        sentence_calls = [c[0] for c in calls if isinstance(c, tuple)]
+        self.assertEqual(["一文目です。", "二文目"], sentence_calls)
 
     async def test_translation_failure_mutes_sentence_and_continues(
         self,
