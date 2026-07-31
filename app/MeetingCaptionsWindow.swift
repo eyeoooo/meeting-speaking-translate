@@ -364,6 +364,18 @@ final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegat
     }
 
     private func applyState(_ json: [String: Any]) {
+        // digital-zero = 会议采集持续全零：录音在录空白，字幕永远不会出来。
+        // 2026-07-31 Teams 实战整场作废：告警只到菜单角标，用户全程没看见。
+        // 字幕窗是用户会中盯着的面，所以告警期间状态行必须让位给它，
+        // 压过一切常规状态文案；告警恢复后下一条 state 自然把状态行还原。
+        let alerts = (json["alerts"] as? [String]) ?? []
+        if alerts.contains(where: { $0.contains("digital-zero") }) {
+            setStatus(
+                "🔴 听不到会议声音，请检查 Teams 扬声器是否设为 BlackHole 2ch",
+                emphasized: true
+            )
+            return
+        }
         let interpreter = json["interpreter"] as? [String: Any]
         let enabled = (interpreter?["enabled"] as? Bool) ?? false
         let connected = (interpreter?["connected"] as? Bool) ?? false
@@ -378,8 +390,12 @@ final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegat
 
     // MARK: - 小工具
 
-    private func setStatus(_ text: String) {
+    private func setStatus(_ text: String, emphasized: Bool = false) {
         statusLabel.stringValue = text
+        statusLabel.font = emphasized
+            ? .systemFont(ofSize: 13, weight: .bold)
+            : .systemFont(ofSize: 11)
+        statusLabel.textColor = emphasized ? .systemRed : .secondaryLabelColor
     }
 
     private func formatElapsed(_ record: [String: Any]) -> String {
