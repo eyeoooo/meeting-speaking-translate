@@ -16,6 +16,7 @@ sys.path.insert(0, str(AUDIO_GATEWAY_ROOT))
 
 from audio_gateway.devices import (  # noqa: E402
     MONITOR_FOLLOW_SYSTEM,
+    monitor_should_reroute_to_headset,
     resolve_monitor_following_default,
 )
 
@@ -81,3 +82,35 @@ def test_missing_default_output_degrades_to_no_monitor():
 def test_sentinel_value_is_stable_contract():
     # Swift 侧以 --monitor system 传参，这个字符串就是跨语言契约
     assert MONITOR_FOLLOW_SYSTEM == "system"
+
+
+# ---- 监听归耳（2026-07-31 真实会议 20260731-171929 教训）----
+# 用户戴 Lenovo 耳麦发言，系统默认输出却是 Mac mini 扬声器：自己的日语
+# 在耳机里、客户的声音在房间外放，用户"只听得见自己"。耳麦一旦确认，
+# 会议原声必须与发言回放同进这台耳麦。
+
+FOLLOW_NOTE = "监听跟随系统默认输出：#7 Mac mini扬声器"
+
+
+def test_reroutes_to_headset_when_follow_mode_picked_another_device():
+    # 复现事故现场：monitor=扬声器(7)，耳麦=3 → 必须改道
+    assert monitor_should_reroute_to_headset(7, FOLLOW_NOTE, 3)
+
+
+def test_reroutes_even_when_follow_mode_found_no_default_output():
+    # 系统没有默认输出（monitor=None）但耳麦在：会议原声不能凭空消失
+    assert monitor_should_reroute_to_headset(None, "系统没有可用的默认输出设备", 3)
+
+
+def test_no_reroute_when_already_on_the_headset():
+    assert not monitor_should_reroute_to_headset(3, FOLLOW_NOTE, 3)
+
+
+def test_no_reroute_without_a_confirmed_headset():
+    # 纯字幕/无安全耳机形态（own_device=-1）：维持跟随系统默认
+    assert not monitor_should_reroute_to_headset(7, FOLLOW_NOTE, -1)
+
+
+def test_explicit_monitor_keyword_is_never_overridden():
+    # 显式 --monitor <设备> 时 monitor_note 为 None：用户点名的设备不改道
+    assert not monitor_should_reroute_to_headset(7, None, 3)

@@ -1356,6 +1356,7 @@ def run_bridge(
         else None
     )
     monitor_player = None
+    mon_tap = None
     if monitor is not None:
         mon_tap = bus.subscribe("monitor", maxsize=8, drop_oldest=True)
         monitor_player = MonitorPlayer(
@@ -1609,6 +1610,34 @@ def run_bridge(
                     )
                 )
                 print(f"[bridge] {own_note}", flush=True)
+            # 监听归耳：耳麦已确认时，会议原声与你的日语必须同进这台耳麦
+            # （理由与判定见 monitor_should_reroute_to_headset docstring）。
+            # 此刻 lifecycle 还没 start，换 player 是安全的；tap 沿用同一份
+            # 订阅，旧 player 从未启动无需收尾。
+            if devices_module.monitor_should_reroute_to_headset(
+                monitor, dev.monitor_note, own_device
+            ):
+                if mon_tap is None:
+                    mon_tap = bus.subscribe("monitor", maxsize=8, drop_oldest=True)
+                monitor = own_device
+                monitor_player = MonitorPlayer(
+                    mon_tap,
+                    monitor,
+                    cfg.samplerate,
+                    cfg.blocksize,
+                    on_status=status_callback("monitor"),
+                    on_error=error_callback("monitor"),
+                )
+                lifecycle.monitor = monitor_player
+                try:
+                    _headset_name = str(sd.query_devices(monitor)["name"])
+                except Exception:
+                    _headset_name = "耳麦"
+                print(
+                    f"[bridge] 监听改道进耳机：#{monitor} {_headset_name}"
+                    "（会议原声与你的日语同进耳麦，不再外放）",
+                    flush=True,
+                )
             # clone/cascade 的音频是 ElevenLabs 整句突发（几乎一次到齐），
             # 用 150ms 预缓冲换回 0.25s 首音延迟；translate/expressive 是
             # OpenAI 实时细流，保持 400ms 抖动保护。
@@ -2064,7 +2093,13 @@ def run_bridge(
     else:
         runtime_state.mark_up()
         if monitor_player:
-            print("[bridge] 下行监听已开启（会议声音在 Mac mini 本机播放）")
+            # 设备名必须落进每场会议的启动日志：20260731-171929 那场
+            # "只听得见自己"，事后归因全靠"监听在哪个设备"这一行。
+            try:
+                _mon_name = str(sd.query_devices(monitor)["name"])
+                print(f"[bridge] 下行监听已开启（会议原声 → #{monitor} {_mon_name}）")
+            except Exception:
+                print("[bridge] 下行监听已开启")
 
     health_task = loop.create_task(health_watch())
     print(

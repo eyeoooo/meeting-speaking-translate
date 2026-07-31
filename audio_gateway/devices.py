@@ -180,6 +180,27 @@ def resolve_own_voice_output(
     )
 
 
+def monitor_should_reroute_to_headset(
+    monitor: int | None,
+    monitor_note: str | None,
+    own_device: int,
+) -> bool:
+    """发言/排练已确认耳麦时，"跟随系统默认"的监听是否应改道进同一台耳麦。
+
+    2026-07-31 真实会议（20260731-171929）教训：用户戴 Lenovo 耳麦发言，
+    系统默认输出却是 Mac mini 扬声器——自己的日语在耳机里、客户的声音在
+    房间外放，用户"只听得见自己"。会议里"你的耳朵"只有一个物理位置：
+    耳麦一旦确认（own_device 有效），会议原声必须与你的日语同进这台耳麦。
+    monitor_note 只有"跟随系统默认"模式才会置值；显式 --monitor <设备>
+    时为 None——用户点名的设备不改道。
+    """
+    if own_device < 0:
+        return False
+    if monitor_note is None:
+        return False
+    return monitor is None or monitor != own_device
+
+
 def list_devices() -> str:
     lines = ["idx  in/out  default_sr  name", "---  ------  ----------  ----"]
     for idx, dev in enumerate(sd.query_devices()):
