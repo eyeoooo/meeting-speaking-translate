@@ -11,6 +11,7 @@ from __future__ import annotations
 import difflib
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -34,16 +35,24 @@ _HOTWORD_COOLDOWN_S = 8.0
 # 提问/请求句同样即触发（2026-08-07 基础功能裁定）：普通提问往往不含
 # 热词，若等常规节流（25s+3 句），提示到的时候用户早已被迫开口——
 # 回复提示的价值窗口就是对方问完的那几秒。判定是确定性代码：
-# 句尾「か」（ですか/ますか/でしょうか/ませんか…全收）、问号、
-# 句尾「ください」（请求形）。误触发由模型的（观望）与冷却兜底。
-_ASK_SUFFIXES = ("か", "ください")
+# 「か」（ですか/ますか/でしょうか/ませんか…全收）、「ください」、
+# 「お願いします/お願いいたします」（面试对抗实锤：自我介绍这类
+# 最高频的请求形曾整题静默）、问号。句读位置不限句尾——ASR 偶发
+# 把两句并成一个 utterance（「〜教えてください。ちなみに〜」），
+# 只看结尾会漏。误触发由模型的（观望）与冷却兜底。
+_ASK_RE = re.compile(r"(?:か|ください|お願い(?:いた)?します)\s*(?:[。．.！!]|$)")
+
+# 提问冷却比热词短：面试对抗实锤，8s 冷却（且从上次 API 响应起算）
+# 会把追问/连续提问成批吞掉——而每个新问题都是一次真实的答话需求。
+# 3s 只挡同一 utterance 被 ASR 拆句后的重复触发。
+_ASK_COOLDOWN_S = 3.0
 
 
 def _is_direct_ask(sentence: str) -> bool:
     text = sentence.strip()
     if "？" in text or "?" in text:
         return True
-    return text.rstrip("。．.！!　 ").endswith(_ASK_SUFFIXES)
+    return bool(_ASK_RE.search(text))
 
 # E-1 失败退避：8s 起指数翻倍，封顶 300s。真实事故背书：持续失败时旧实现
 # 每句一次 API（163 句会议 ≈163 次调用 ≈$6），且用户全程无感。
@@ -58,9 +67,11 @@ _BRIEF_MISMATCH_MARK = "（背景不符）"
 _SYSTEM = """\
 你是我方的实时会议参谋，输出只有我一个人看到，而且我正在开会——只有一眼的注意力。\
 输入是会议的日语原文转写，不是译文。基于【会议背景与目标】与滚动的日语原文判断。
-你的基础职责是回复提示：对方就业务向我方提问、确认或提出请求时，\
-必须给出要点与话术——那一刻我正需要一句能照着回的话。\
-寒暄性提问（"最近怎么样"之类）不算业务提问，照常观望。
+你的基础职责是回复提示：对方就正事向我方提问、确认或提出请求时，\
+必须给出要点与话术两行——那一刻我正需要一句能照着回的话。\
+回答内容长的问题（自我介绍、经历说明之类），话术给回答的开场第一句\
+即可，不必囊括全部内容——有开场句我就能接着说下去。\
+寒暄性提问（"最近怎么样"之类）不算正事提问，照常观望。
 其余时候的开口门槛：只有当建议能改变我接下来要说的话时才开口。\
 仅是归纳信息、复述局势、泛泛提醒（"注意倾听""保持礼貌"之类），\
 一律输出：（观望）。同一个意思提示过一次就不再重复。
@@ -82,6 +93,9 @@ _SYSTEM = """\
 对方要求当天发报告（与惯例不符）→ 要点: ⚠ 报告惯例周五发，今天只有半成品
 话术: レポートは毎週金曜にお送りしております。本日時点の途中経過でよろしければ共有いたします。（报告惯例周五发，今天的阶段性结果可以先共享）
 （请求类提问也必须给话术——哪怕建议是婉拒，也要给出婉拒的原话）
+对方请我方展开说明（回答很长）→ 要点: 按 brief 口径讲，先给结论再展开
+话术: はい、結論から申しますと、〇〇でございます。（好的，先说结论是〇〇）
+（开场句就够——绝不能因为回答长就省略话术）
 上一条建议还适用 → （观望）"""
 
 # 「观望」判定放宽：去两端标点后以"观望"开头且全文很短即视为无内容。
@@ -100,8 +114,12 @@ def _is_watch(advice: str) -> bool:
 # ---- 一眼可扫（2026-08-07 用户裁定：会中的人只有一瞥的注意力）-------------
 # 模型契约=最多两行（要点/话术）；契约由代码执行，不指望模型自觉。
 ADVICE_POINT_MAX_CHARS = 40    # 要点硬上限：超出截断——标题被剪仍是标题
-ADVICE_SCRIPT_MAX_CHARS = 80   # 话术硬上限：超出整行丢弃——半句话术
-#                                照着念出口比没有更危险（max_tokens 同一裁定）
+# 话术上限：话术是念的不是读的，量的是"一口气能不能念完"，不是一瞥
+# 负担。面试对抗实锤：80 字连"日语原话+中文对照"的正常体量（实测
+# 86-135 字）都装不下，模型给的好话术全被闸门静默砍掉。160 字容纳
+# 两句开场+对照；超限先剥（中文对照）保住可念的日语；纯日语仍超限
+# 才整行丢——绝不截半句（半句话术照着念出口比没有更危险）。
+ADVICE_SCRIPT_MAX_CHARS = 160
 _ADVICE_REPEAT_WINDOW_S = 180.0     # 重复冷却：同一建议 3 分钟内不再上屏
 _ADVICE_REPEAT_SIMILARITY = 0.80    # 与自回声防线同一相似度判据
 
@@ -147,7 +165,14 @@ def condense_advice(advice: str) -> str | None:
     if len(point) > ADVICE_POINT_MAX_CHARS:
         point = point[:ADVICE_POINT_MAX_CHARS] + "…"
     lines = [point]
-    if script and len(script) <= ADVICE_SCRIPT_MAX_CHARS:
+    if script and len(script) > ADVICE_SCRIPT_MAX_CHARS:
+        speakable = script.split("（", 1)[0].strip()
+        script = (
+            speakable
+            if 0 < len(speakable) <= ADVICE_SCRIPT_MAX_CHARS
+            else None
+        )
+    if script:
         lines.append(f"话术: {script}")
     return "\n".join(lines)
 
@@ -480,10 +505,9 @@ class Advisor:
         if now < self._backoff_until:
             return False
         since = now - self._last_call_t
-        if since >= _HOTWORD_COOLDOWN_S and (
-            any(w in sentence for w in self._hotwords)
-            or _is_direct_ask(sentence)
-        ):
+        if _is_direct_ask(sentence) and since >= _ASK_COOLDOWN_S:
+            return True
+        if any(w in sentence for w in self._hotwords) and since >= _HOTWORD_COOLDOWN_S:
             return True
         return (self._new_since_call >= self._cfg.advisor_min_new_segments
                 and since >= self._cfg.advisor_interval_s)
@@ -594,6 +618,12 @@ class Advisor:
             self._state.record_suppressed()
             return
         advice = condense_advice(advice)
+        if (
+            advice
+            and "话术:" not in advice
+            and _is_direct_ask(latest)
+        ):
+            advice = self._retry_for_script(prompt, advice) or advice
         if not advice or self._is_repeat_advice(advice):
             # 重复的建议对会中的人是纯噪音：模型每 25s 重看一遍上下文，
             # 很容易把同一提醒再说一遍——由代码而不是提示词拦住它。
@@ -604,6 +634,30 @@ class Advisor:
         )
         self._state.record_delivery()
         self._sink.post(advice)
+
+    def _retry_for_script(self, prompt: str, first: str) -> str | None:
+        """提问必须有话术（基础职责）；模型偶发只给要点——补一枪。
+
+        面试对抗实锤：8 卡中 2 卡缺话术，思考模式下温度锁定压不住
+        方差，由代码补救：带着首次输出重问一次，仍无话术就沿用原卡。
+        任何失败静默返回 None——补救绝不能弄丢已有的卡片。
+        """
+        retry_prompt = (
+            f"{prompt}\n\n你刚才的输出：\n{first}\n"
+            "话术行缺失。重新输出完整两行（要点+话术），"
+            "话术必须是可直接照念的原话。"
+        )
+        self._state.record_call()
+        try:
+            raw = self._brain.advise(retry_prompt)
+        except Exception:
+            return None
+        if not raw or _is_watch(raw):
+            return None
+        condensed = condense_advice(self._extract_brief_mismatch(raw))
+        if condensed and "话术:" in condensed:
+            return condensed
+        return None
 
     def _is_repeat_advice(self, advice: str) -> bool:
         now = time.monotonic()

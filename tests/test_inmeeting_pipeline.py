@@ -438,15 +438,32 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
         )
 
     def test_long_point_is_truncated_and_long_script_is_dropped(self) -> None:
-        # 要点超限截断（标题被剪仍是标题）；话术超限整行丢弃——半句话术
-        # 照着念出口比没有更危险（与 max_tokens 截断同一裁定）。
+        # 要点超限截断（标题被剪仍是标题）；话术真失控（剥掉中文对照后
+        # 纯日语仍超限）才整行丢弃——绝不截半句（半句话术照着念出口
+        # 比没有更危险，与 max_tokens 截断同一裁定）。
         out = condense_advice(
-            f"要点: {'长' * 60}\n话术: {'あ' * 100}"
+            f"要点: {'长' * 60}\n话术: {'あ' * 200}"
         )
         self.assertIsNotNone(out)
         lines = out.splitlines()
         self.assertEqual(1, len(lines))
         self.assertEqual("长" * ADVICE_POINT_MAX_CHARS + "…", lines[0])
+
+    def test_overlong_script_sheds_gloss_to_keep_the_speakable_part(self) -> None:
+        # 面试对抗实锤：模型给的好话术（日语原话+中文对照 135 字）曾被
+        # 旧 80 字闸静默砍掉——话术是念的不是读的。超限时先剥（中文
+        # 对照）保住可念的日语，只有纯日语仍超限才丢。
+        speakable = "は" * 100
+        out = condense_advice(
+            f"要点: 报年限与技术栈\n话术: {speakable}（{'长' * 100}）"
+        )
+        self.assertEqual(
+            f"报年限与技术栈\n话术: {speakable}", out
+        )
+        # 正常体量（≤160 字含对照）原样保留
+        kept = "御社が第一志望です。（贵司是第一志望）"
+        out2 = condense_advice(f"要点: 别承诺独家\n话术: {kept}")
+        self.assertEqual(f"别承诺独家\n话术: {kept}", out2)
 
     def test_freeform_output_falls_back_to_first_line_only(self) -> None:
         # 模型完全不守格式时：第一行非空文本兜底成要点，永远最多两行。
@@ -486,8 +503,9 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
 
     def test_direct_questions_trigger_immediately_with_cooldown(self) -> None:
         # 基础功能（2026-08-07 用户裁定）：回复提示的价值窗口是对方问完
-        # 的那几秒。提问/请求句（句尾か/？/ください）绕过常规节流即刻
-        # 触发；冷却与热词同款，陈述句仍走常规节流。
+        # 的那几秒。提问/请求句（か/？/ください/お願いします，句读位置
+        # 不限）绕过常规节流即刻触发；冷却 3s 只挡 ASR 拆句重复——
+        # 面试对抗实锤：8s 冷却会把连续提问成批吞掉。陈述句走常规节流。
         cfg = GatewayConfig()
         cfg.advisor_backend = "claude"
         with patch("audio_gateway.advisor._ClaudeBrain"):
@@ -505,17 +523,55 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
             self.assertTrue(
                 advisor._should_call("レポートを本日中にお送りください。")
             )
+            # 面试第一题的请求形（对抗第一轮曾整题静默）
+            self.assertTrue(
+                advisor._should_call("簡単に自己紹介をお願いします。")
+            )
+            # ASR 并句：问句在句中也要触发
+            self.assertTrue(advisor._should_call(
+                "希望年収を教えてください。ちなみに予算は450万円程度ですが。"
+            ))
             # 陈述句：不即触发，走常规节流
             self.assertFalse(advisor._should_call("承知しました。"))
-            # 冷却内的提问不重复触发
+            # 3s 冷却：窗口内不触发（挡拆句重复），过窗即放行（连续提问）
             advisor._last_call_t = clock["now"]
             self.assertFalse(
                 advisor._should_call("次回は水曜でよろしいですか。")
             )
-            clock["now"] += 9.0  # 过了 8s 冷却
+            clock["now"] += 3.5
             self.assertTrue(
                 advisor._should_call("次回は水曜でよろしいですか。")
             )
+
+    def test_missing_script_on_a_question_triggers_one_retry(self) -> None:
+        # 提问必须有话术（基础职责）；模型偶发只给要点时由代码补一枪，
+        # 拿到话术用补问结果；非提问触发的卡不补问。
+        cfg = GatewayConfig()
+        cfg.advisor_backend = "claude"
+        state = AdvisorState(enabled=True)
+        sink = Mock()
+        brain = Mock()
+        brain.advise.side_effect = [
+            "要点: 用对账引擎举证",
+            "要点: 用对账引擎举证\n话术: 直近では消込エンジンを実装しました。（最近实现了对账引擎）",
+        ]
+        brain.last_stop_reason = "end_turn"
+        with patch("audio_gateway.advisor._ClaudeBrain") as brain_type:
+            brain_type.return_value = brain
+            advisor = Advisor(cfg, sink, state=state)
+
+        advisor._call("ご自身で実装された部分はありますか。")
+
+        self.assertEqual(2, brain.advise.call_count)
+        self.assertIn("话术行缺失", brain.advise.call_args.args[0])
+        delivered = sink.post.call_args.args[0]
+        self.assertIn("话术: 直近では消込エンジンを実装しました。", delivered)
+        self.assertEqual(2, state.snapshot()["calls"])
+
+        # 陈述句触发（常规节流路径）缺话术不补问
+        brain.advise.side_effect = ["要点: 对方在赶进度，可主动汇报风险"]
+        advisor._call("スケジュールが厳しくなってきました。")
+        self.assertEqual(3, brain.advise.call_count)
 
     def test_delivered_advice_is_fed_back_into_the_prompt(self) -> None:
         # 换措辞的同义重复（实测相似度仅 0.56）代码闸拦不住——只有模型
