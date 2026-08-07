@@ -364,14 +364,30 @@ class _ClaudeBrain:
         # 最近一次调用的 stop_reason，供 Advisor 对 max_tokens 单独记账。
         self.last_stop_reason: str | None = None
 
-    def advise(self, prompt: str) -> str | None:
+    def advise(self, prompt: str, brief: str = "") -> str | None:
         self.last_stop_reason = None
+        # brief 进 system 缓存块（cascade 翻译器同款模式）：简历/JD 塞进
+        # brief 后体量可达数千字，而它整场基本不变——规则块与背景块分开
+        # 打 cache_control，会中热重载 brief 只失效背景块，规则块照常命中。
+        system_blocks: list[dict] = [
+            {
+                "type": "text",
+                "text": _SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ]
+        if brief:
+            system_blocks.append({
+                "type": "text",
+                "text": f"【会议背景与目标】\n{brief}",
+                "cache_control": {"type": "ephemeral"},
+            })
         resp = self._client.beta.messages.create(
             model=self._model,
             max_tokens=self._MAX_TOKENS,
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
-            system=_SYSTEM,
+            system=system_blocks,
             messages=[{"role": "user", "content": prompt}],
         )
         self.last_stop_reason = resp.stop_reason
@@ -388,7 +404,9 @@ class _OllamaBrain:
         self._client = httpx.Client(base_url=url, timeout=60.0)
         self._model = model
 
-    def advise(self, prompt: str) -> str | None:
+    def advise(self, prompt: str, brief: str = "") -> str | None:
+        if brief:
+            prompt = f"【会议背景与目标】\n{brief}\n\n{prompt}"
         resp = self._client.post("/api/generate", json={
             "model": self._model,
             "system": _SYSTEM,
@@ -404,7 +422,9 @@ class _OpenAIBrain:
         from .openai_client import OpenAIChatClient
         self._client = OpenAIChatClient(model, base_url, timeout=60.0)
 
-    def advise(self, prompt: str) -> str | None:
+    def advise(self, prompt: str, brief: str = "") -> str | None:
+        if brief:
+            prompt = f"【会议背景与目标】\n{brief}\n\n{prompt}"
         return self._client.complete(_SYSTEM, prompt, max_tokens=1024) or None
 
 
@@ -572,15 +592,16 @@ class Advisor:
             if recent
             else ""
         )
+        # brief 不进 user prompt：由 brain 放进带缓存的 system 块
+        #（Ollama/OpenAI 后端在各自 advise 里回拼，行为等价）。
         prompt = (
-            f"【会议背景与目标】\n{self._brief}\n\n"
             f"【最近会议日语原文】\n" + "\n".join(self._lines) +
             f"\n\n【最新日语原文发言】\n{latest}"
             f"{memory}\n\n请按格式给出建议。"
         )
         self._state.record_call()
         try:
-            advice = self._brain.advise(prompt)
+            advice = self._brain.advise(prompt, brief=self._brief)
         except Exception as e:
             # E-1 关键：失败也推进节流时钟并清空新句计数，否则"持续失败 =
             # 每句一次 API"（实测一场 163 句会议就是 163 次调用）。
@@ -649,7 +670,7 @@ class Advisor:
         )
         self._state.record_call()
         try:
-            raw = self._brain.advise(retry_prompt)
+            raw = self._brain.advise(retry_prompt, brief=self._brief)
         except Exception:
             return None
         if not raw or _is_watch(raw):

@@ -758,9 +758,12 @@ class AdvisorReliabilityTests(unittest.TestCase):
             os.utime(brief, (future, future))
             advisor._call("10時はいかがですか")
 
-        prompt = brain.advise.call_args.args[0]
-        self.assertIn("目标B：确认日程安排", prompt)
-        self.assertNotIn("目标A", prompt)
+        # brief 经 kwargs 进 brain（Claude 后端放进带缓存的 system 块），
+        # 不再拼进 user prompt。
+        brief_kw = brain.advise.call_args.kwargs["brief"]
+        self.assertIn("目标B：确认日程安排", brief_kw)
+        self.assertNotIn("目标A", brief_kw)
+        self.assertNotIn("目标A", brain.advise.call_args.args[0])
 
     def test_brief_mismatch_marker_is_stripped_and_surfaced_in_state(
         self,
@@ -797,7 +800,14 @@ class AdvisorReliabilityTests(unittest.TestCase):
             stop_reason="max_tokens",
             content=[SimpleNamespace(type="text", text="半截建议")],
         )
-        self.assertIsNone(brain.advise("p"))
+        self.assertIsNone(brain.advise("p", brief="面试背景：应聘后端岗"))
+        # brief 进 system 缓存块（简历/JD 体量大且整场不变）：规则块与
+        # 背景块分开打 cache_control，热重载 brief 不失效规则块缓存。
+        system = client.beta.messages.create.call_args.kwargs["system"]
+        self.assertEqual(2, len(system))
+        self.assertEqual({"type": "ephemeral"}, system[0]["cache_control"])
+        self.assertEqual({"type": "ephemeral"}, system[1]["cache_control"])
+        self.assertIn("面试背景：应聘后端岗", system[1]["text"])
         self.assertEqual("max_tokens", brain.last_stop_reason)
 
         client.beta.messages.create.return_value = SimpleNamespace(

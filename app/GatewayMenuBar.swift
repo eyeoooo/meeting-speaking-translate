@@ -280,6 +280,11 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         let folder = NSMenuItem(title: "打开会议文件夹", action: #selector(openMeetingsFolder), keyEquivalent: "")
         folder.target = self
         menu.addItem(folder)
+        // 会前准备的正门（2026-08-07 裁定：简历/JD/口径这类背景资料
+        // 就该开会前写进 brief）——参谋话术质量的上限就是 brief 的细致度。
+        let brief = NSMenuItem(title: "编辑会议背景（brief）", action: #selector(openBrief), keyEquivalent: "")
+        brief.target = self
+        menu.addItem(brief)
         menu.addItem(.separator())
 
         // 工程动作收进子菜单：日常菜单里不出现"调试""日志"这类开发者词汇
@@ -1143,6 +1148,30 @@ final class GatewayController: NSObject, NSApplicationDelegate {
 
     @objc private func openMeetingsFolder() {
         NSWorkspace.shared.open(meetingsRoot)
+    }
+
+    @objc private func openBrief() {
+        let brief = meetingsRoot.appendingPathComponent("brief.md")
+        if !FileManager.default.fileExists(atPath: brief.path) {
+            // 首次打开落一份骨架：告诉用户写什么、去哪找完整模板。
+            // 绝不覆盖已有文件——brief 是用户的会前准备成果。
+            let skeleton = """
+            # 会议背景（brief）
+
+            开会/面试前把背景资料写在这里，参谋的话术全靠它：
+            - 面试：公司与岗位 JD、简历要点、自我介绍开场、
+              离职理由/弱点/薪资的口径与底线、逆问预备
+            - 商务会议：我方目标与底线、当前进度与数字口径、
+              已知风险、对方情况
+
+            完整模板见仓库 docs/brief-templates/（interview.md / meeting.md）。
+            会议中途修改本文件会自动生效，无需重启。
+            """
+            try? FileManager.default.createDirectory(
+                at: meetingsRoot, withIntermediateDirectories: true)
+            try? skeleton.write(to: brief, atomically: true, encoding: .utf8)
+        }
+        NSWorkspace.shared.open(brief)
     }
 
     @objc private func openPanel() {

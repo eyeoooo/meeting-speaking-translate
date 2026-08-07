@@ -170,6 +170,11 @@ export OPENAI_API_KEY="..."
 - 参谋（`--advise`，需 `ANTHROPIC_API_KEY`）：只读会议日语原文，
   永不消费译文与你的发言；背景 brief 读 `~/AudioGateway/brief.md`，
   支持会中热重载；失败指数退避（8s 起、封顶 300s）。
+- **brief 是参谋话术质量的上限**：开会/面试前把背景资料写进去——
+  菜单「编辑会议背景（brief）」一键打开；结构化模板见
+  `docs/brief-templates/`（面试：公司与岗位 JD、简历要点、各高频
+  问题口径与薪资底线、逆问预备；商务会议：目标底线、进度与数字
+  口径、风险、对方情况）。brief 全文走 prompt cache，写细不心疼钱。
 
 ### 4.1 发言方向（排练 / 正式发言 / 我的声音）
 
