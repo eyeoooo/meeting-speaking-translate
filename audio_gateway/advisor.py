@@ -143,6 +143,11 @@ _ADVICE_REPEAT_SIMILARITY = 0.80    # 与自回声防线同一相似度判据
 _POINT_LABELS = ("要点：", "要点:")
 _SCRIPT_LABELS = ("话术：", "话术:")
 
+# 异常文字防线（cascade 谚文防火墙的 advisor 版）：30 轮终考实锤，
+# 话术里出现过西里尔字母（「三つ目」写成「триつ目」）——照着念
+# 会当场卡壳。检出→补问一枪→仍异常则整卡放弃。
+_SCRIPT_ANOMALY_RE = re.compile(r"[Ѐ-ӿ가-힯ᄀ-ᇿ]")
+
 
 def condense_advice(advice: str) -> str | None:
     """把模型输出压成"一眼可扫"的最多两行。
@@ -662,6 +667,14 @@ class Advisor:
             self._state.record_suppressed()
             return
         advice = condense_advice(advice)
+        if advice and _SCRIPT_ANOMALY_RE.search(advice):
+            advice = self._retry_once(
+                prompt, advice,
+                "输出里混入了非中日文的异常文字，照着念会卡壳。"
+                "重新输出完整两行，只用中文与日文。",
+            )
+            if advice and _SCRIPT_ANOMALY_RE.search(advice):
+                advice = None  # 两次都异常：宁缺毋滥
         if (
             advice
             and "话术:" not in advice
@@ -679,17 +692,12 @@ class Advisor:
         self._state.record_delivery()
         self._sink.post(advice)
 
-    def _retry_for_script(self, prompt: str, first: str) -> str | None:
-        """提问必须有话术（基础职责）；模型偶发只给要点——补一枪。
-
-        面试对抗实锤：8 卡中 2 卡缺话术，思考模式下温度锁定压不住
-        方差，由代码补救：带着首次输出重问一次，仍无话术就沿用原卡。
-        任何失败静默返回 None——补救绝不能弄丢已有的卡片。
-        """
+    def _retry_once(
+        self, prompt: str, first: str, instruction: str
+    ) -> str | None:
+        """带着首次输出补问一枪的通用补救；失败静默返回 None。"""
         retry_prompt = (
-            f"{prompt}\n\n你刚才的输出：\n{first}\n"
-            "话术行缺失。重新输出完整两行（要点+话术），"
-            "话术必须是可直接照念的原话。"
+            f"{prompt}\n\n你刚才的输出：\n{first}\n{instruction}"
         )
         self._state.record_call()
         try:
@@ -698,7 +706,19 @@ class Advisor:
             return None
         if not raw or _is_watch(raw):
             return None
-        condensed = condense_advice(self._extract_brief_mismatch(raw))
+        return condense_advice(self._extract_brief_mismatch(raw))
+
+    def _retry_for_script(self, prompt: str, first: str) -> str | None:
+        """提问必须有话术（基础职责）；模型偶发只给要点——补一枪。
+
+        面试对抗实锤：8 卡中 2 卡缺话术，思考模式下温度锁定压不住
+        方差，由代码补救：带着首次输出重问一次，仍无话术就沿用原卡。
+        """
+        condensed = self._retry_once(
+            prompt, first,
+            "话术行缺失。重新输出完整两行（要点+话术），"
+            "话术必须是可直接照念的原话。",
+        )
         if condensed and "话术:" in condensed:
             return condensed
         return None

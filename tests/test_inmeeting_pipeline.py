@@ -572,6 +572,39 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
         second_prompt = brain.advise.call_args_list[1].args[0]
         self.assertIn("自己紹介", second_prompt)
 
+    def test_cyrillic_anomaly_is_retried_then_dropped(self) -> None:
+        # 30 轮终考实锤：话术里出现「триつ目」（西里尔字母），照着念
+        # 会当场卡壳。规格：检出异常文字→补问一枪；两次都异常→整卡
+        # 放弃（宁缺毋滥）；补问干净则投递补问结果。
+        cfg = GatewayConfig()
+        cfg.advisor_backend = "claude"
+        state = AdvisorState(enabled=True)
+        sink = Mock()
+        brain = Mock()
+        brain.advise.side_effect = [
+            "要点: 说三个轴\n话术: триつ目は金融分野です。",
+            "要点: 说三个轴\n话术: 三つ目は金融分野です。",
+        ]
+        brain.last_stop_reason = "end_turn"
+        with patch("audio_gateway.advisor._ClaudeBrain") as brain_type:
+            brain_type.return_value = brain
+            advisor = Advisor(cfg, sink, state=state)
+        advisor._call("転職の軸を教えてください。")
+        self.assertEqual(2, brain.advise.call_count)
+        delivered = sink.post.call_args.args[0]
+        self.assertIn("三つ目は金融分野です。", delivered)
+        self.assertNotIn("три", delivered)
+
+        # 两次都异常：整卡放弃，计入 suppressed
+        sink.reset_mock()
+        brain.advise.side_effect = [
+            "要点: 说轴\n话术: триつ目です。",
+            "要点: 说轴\n话术: 두 번째です。",
+        ]
+        advisor._call("軸をもう一度教えてください。")
+        sink.post.assert_not_called()
+        self.assertEqual(1, state.snapshot()["delivered"])
+
     def test_missing_script_on_a_question_triggers_one_retry(self) -> None:
         # 提问必须有话术（基础职责）；模型偶发只给要点时由代码补一枪，
         # 拿到话术用补问结果；非提问触发的卡不补问。
