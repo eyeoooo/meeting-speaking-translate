@@ -8,10 +8,12 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -40,18 +42,23 @@ _BACKOFF_MAX_S = 300.0
 _BRIEF_MISMATCH_MARK = "（背景不符）"
 
 _SYSTEM = """\
-你是我方的实时会议参谋，输出只有我一个人看到。输入是会议的日语原文转写，不是译文。\
-基于【会议背景与目标】与滚动的日语原文，\
-给出简短、马上能用的建议。规则：
-- 没有值得说的新信息时，只输出：（观望）
-- 有建议时用以下 Markdown 格式，总长不超过 150 字：
-局势: 一句话
-建议: 1~2 条可执行动作
-话术: 适合时给一句可直接说出口的原话（用会议语言，附中文对照）
-风险: 发现对方抛出的数字/期限/承诺陷阱时点名，否则省略此行
+你是我方的实时会议参谋，输出只有我一个人看到，而且我正在开会——只有一眼的注意力。\
+输入是会议的日语原文转写，不是译文。基于【会议背景与目标】与滚动的日语原文判断。
+开口门槛：只有当建议能改变我接下来要说的话时才开口。仅是归纳信息、复述局势、\
+泛泛提醒（"注意倾听""保持礼貌"之类），一律输出：（观望）。\
+同一个意思提示过一次就不再重复。
+有值得说的时，最多输出两行，除这两行外什么都不要写：
+要点: 一句话，30 字以内；对方抛出数字/期限/承诺陷阱时以 ⚠ 开头
+话术: 可选。一句可以直接照着说出口的原话（用会议语言，括号附中文对照）
 - 若【会议背景与目标】与会议实际内容明显不符（例如背景写系统迁移报价、会议在谈日程安排），\
 在第一行单独输出（背景不符），从第二行起照常输出（观望）或建议
-- 转写含识别错误，按上下文理解；技术名词（AWS/Redis/API 等）按行业惯例纠正。"""
+- 转写含识别错误，按上下文理解；技术名词（AWS/Redis/API 等）按行业惯例纠正。
+示例（必须严格模仿的行为）：
+对方在闲聊寒暄 → （观望）
+对方刚要求提前交货 → 要点: ⚠ 对方要的交期比我方计划早两周，别当场答应
+话术: 納期については一度持ち帰って確認させてください。（交期请让我带回确认）
+对方询问报价依据 → 要点: 可按 brief 的阶梯价口径回应
+上一条建议还适用 → （观望）"""
 
 # 「观望」判定放宽：去两端标点后以"观望"开头且全文很短即视为无内容。
 # 旧判据 strip("（）() \n") == "观望" 会漏判「（观望）。」，把裸观望卡片推给用户。
@@ -64,6 +71,65 @@ def _is_watch(advice: str) -> bool:
         # 长文本即使以"观望"开头也可能带着有价值的补充说明，不拦。
         return False
     return text.strip(_WATCH_STRIP_CHARS).startswith("观望")
+
+
+# ---- 一眼可扫（2026-08-07 用户裁定：会中的人只有一瞥的注意力）-------------
+# 模型契约=最多两行（要点/话术）；契约由代码执行，不指望模型自觉。
+ADVICE_POINT_MAX_CHARS = 40    # 要点硬上限：超出截断——标题被剪仍是标题
+ADVICE_SCRIPT_MAX_CHARS = 80   # 话术硬上限：超出整行丢弃——半句话术
+#                                照着念出口比没有更危险（max_tokens 同一裁定）
+_ADVICE_REPEAT_WINDOW_S = 180.0     # 重复冷却：同一建议 3 分钟内不再上屏
+_ADVICE_REPEAT_SIMILARITY = 0.80    # 与自回声防线同一相似度判据
+
+_POINT_LABELS = ("要点：", "要点:")
+_SCRIPT_LABELS = ("话术：", "话术:")
+
+
+def condense_advice(advice: str) -> str | None:
+    """把模型输出压成"一眼可扫"的最多两行。
+
+    契约行照收：要点（截断到上限）+ 话术（超长整行丢弃）；契约外的行
+    全部丢弃。模型不守格式时，第一行非空文本按要点兜底——无论上游
+    输出什么，用户面前永远最多两行。
+    """
+    point: str | None = None
+    script: str | None = None
+    fallback: str | None = None
+    for raw in advice.splitlines():
+        line = raw.strip().lstrip("-•").strip()
+        if not line:
+            continue
+        matched = False
+        for label in _POINT_LABELS:
+            if line.startswith(label):
+                if point is None:
+                    point = line[len(label):].strip()
+                matched = True
+                break
+        if matched:
+            continue
+        for label in _SCRIPT_LABELS:
+            if line.startswith(label):
+                if script is None:
+                    script = line[len(label):].strip()
+                matched = True
+                break
+        if not matched and fallback is None:
+            fallback = line
+    if not point:
+        point = fallback
+    if not point:
+        return None
+    if len(point) > ADVICE_POINT_MAX_CHARS:
+        point = point[:ADVICE_POINT_MAX_CHARS] + "…"
+    lines = [point]
+    if script and len(script) <= ADVICE_SCRIPT_MAX_CHARS:
+        lines.append(f"话术: {script}")
+    return "\n".join(lines)
+
+
+def _normalize_advice(text: str) -> str:
+    return "".join(text.split())
 
 
 class AdvisorState:
@@ -326,6 +392,12 @@ class Advisor:
         )
         self._on_alert = on_alert
         self._alert_active = False
+        # 重复冷却的比对集：只记"真的上过屏"的建议（被抑制的不算——
+        # 否则一条反复被判重复的建议会永远出不来）。元素=(时刻, 归一化文本,
+        # 原文)：归一化文本给代码相似度闸；原文回灌进提示词——换措辞的
+        # 同义重复（实测相似度仅 0.56）代码闸拦不住，只有模型看得懂
+        # "同一个意思"，但它必须先看到自己说过什么。
+        self._recent_advice: deque[tuple[float, str, str]] = deque(maxlen=8)
         # 错误文本必须脱敏后才能进状态/日志（shutdown_secrets 同款约定）。
         self._secret_values = tuple(
             value.strip()
@@ -436,10 +508,24 @@ class Advisor:
 
     def _call(self, latest: str) -> None:
         self._maybe_reload_brief()
+        now = time.monotonic()
+        recent = [
+            raw
+            for delivered_at, _, raw in self._recent_advice
+            if now - delivered_at <= _ADVICE_REPEAT_WINDOW_S
+        ]
+        memory = (
+            "\n\n【你最近已提示过的内容】\n"
+            + "\n".join(f"- {r}" for r in recent)
+            + "\n同一个意思绝不要再说，除非局势有实质变化；没有新话可说就输出（观望）。"
+            if recent
+            else ""
+        )
         prompt = (
             f"【会议背景与目标】\n{self._brief}\n\n"
             f"【最近会议日语原文】\n" + "\n".join(self._lines) +
-            f"\n\n【最新日语原文发言】\n{latest}\n\n请按格式给出建议。"
+            f"\n\n【最新日语原文发言】\n{latest}"
+            f"{memory}\n\n请按格式给出建议。"
         )
         self._state.record_call()
         try:
@@ -480,8 +566,29 @@ class Advisor:
             # 「刚看过、认为无需提示」与「参谋挂了」在面板上必须可区分。
             self._state.record_suppressed()
             return
+        advice = condense_advice(advice)
+        if not advice or self._is_repeat_advice(advice):
+            # 重复的建议对会中的人是纯噪音：模型每 25s 重看一遍上下文，
+            # 很容易把同一提醒再说一遍——由代码而不是提示词拦住它。
+            self._state.record_suppressed()
+            return
+        self._recent_advice.append(
+            (time.monotonic(), _normalize_advice(advice), advice)
+        )
         self._state.record_delivery()
         self._sink.post(advice)
+
+    def _is_repeat_advice(self, advice: str) -> bool:
+        now = time.monotonic()
+        norm = _normalize_advice(advice)
+        for delivered_at, prev, _ in self._recent_advice:
+            if now - delivered_at > _ADVICE_REPEAT_WINDOW_S:
+                continue
+            if norm == prev or difflib.SequenceMatcher(
+                None, norm, prev
+            ).ratio() >= _ADVICE_REPEAT_SIMILARITY:
+                return True
+        return False
 
     def _run(self) -> None:
         while True:

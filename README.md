@@ -65,7 +65,9 @@ thing it's good at: translating complete sentences.
   translation are *never* line-paired; the protocol has no pairing field),
   with gray draft text streaming in before sentences finalize
 - 🧠 **AI meeting advisor** — reads only the counterpart's speech,
-  never your own, never the translations
+  never your own, never the translations; speaks only when it would
+  change what you say next, at most two glanceable lines (a short
+  point + one speakable sentence), one card at a time
 - 🎛️ **Menu-bar native app** — bundled Python runtime (no Homebrew Python
   needed), one-click rehearsal mode that plays only into your headphones
 - ⏱️ **~2s end-to-end speaking latency** — streaming translation feeds TTS

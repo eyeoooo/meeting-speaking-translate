@@ -20,10 +20,12 @@ sys.path.insert(0, str(AUDIO_GATEWAY_ROOT))
 
 from audio_gateway import main  # noqa: E402
 from audio_gateway.advisor import (  # noqa: E402
+    ADVICE_POINT_MAX_CHARS,
     Advisor,
     AdvisorState,
     CallbackAdvisorSink,
     _ClaudeBrain,
+    condense_advice,
 )
 from audio_gateway.bridge import (  # noqa: E402
     AdviceHistory,
@@ -415,6 +417,98 @@ class AdvisorBoundaryTests(unittest.TestCase):
         self.assertEqual(["建议: 先确认期限"], received)
 
 
+class AdvisorGlanceabilityTests(unittest.TestCase):
+    """一眼可扫（2026-08-07 用户裁定）：会中的人只有一瞥的注意力。
+
+    契约=最多两行（要点/话术），由代码执行；重复建议 3 分钟冷却。
+    """
+
+    def test_contract_lines_survive_and_everything_else_is_dropped(self) -> None:
+        # 模型若退回旧四段格式，契约外的行必须被代码丢掉。
+        out = condense_advice(
+            "局势: 正在谈交期\n"
+            "要点: ⚠ 对方要的交期早两周\n"
+            "话术: 納期は持ち帰って確認します。（交期带回确认）\n"
+            "风险: 对方在压价"
+        )
+        self.assertEqual(
+            "⚠ 对方要的交期早两周\n"
+            "话术: 納期は持ち帰って確認します。（交期带回确认）",
+            out,
+        )
+
+    def test_long_point_is_truncated_and_long_script_is_dropped(self) -> None:
+        # 要点超限截断（标题被剪仍是标题）；话术超限整行丢弃——半句话术
+        # 照着念出口比没有更危险（与 max_tokens 截断同一裁定）。
+        out = condense_advice(
+            f"要点: {'长' * 60}\n话术: {'あ' * 100}"
+        )
+        self.assertIsNotNone(out)
+        lines = out.splitlines()
+        self.assertEqual(1, len(lines))
+        self.assertEqual("长" * ADVICE_POINT_MAX_CHARS + "…", lines[0])
+
+    def test_freeform_output_falls_back_to_first_line_only(self) -> None:
+        # 模型完全不守格式时：第一行非空文本兜底成要点，永远最多两行。
+        out = condense_advice("对方刚抛出新报价\n然后是三段分析…\n再来一段")
+        self.assertEqual("对方刚抛出新报价", out)
+
+    def test_empty_output_condenses_to_none(self) -> None:
+        self.assertIsNone(condense_advice("   \n  \n"))
+
+    def test_repeat_advice_is_suppressed_within_cooldown(self) -> None:
+        # 模型每 25s 重看一遍上下文，很容易把同一提醒再说一遍——
+        # 重复冷却由代码拦截：同一建议 3 分钟内只上屏一次，窗口过后放行。
+        cfg = GatewayConfig()
+        cfg.advisor_backend = "claude"
+        state = AdvisorState(enabled=True)
+        sink = Mock()
+        brain = Mock()
+        brain.advise.return_value = "要点: 可按阶梯价口径回应"
+        brain.last_stop_reason = "end_turn"
+        with patch("audio_gateway.advisor._ClaudeBrain") as brain_type:
+            brain_type.return_value = brain
+            advisor = Advisor(cfg, sink, state=state)
+        clock = {"now": 1000.0}
+        with patch(
+            "audio_gateway.advisor.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            advisor._call("価格の根拠を教えてください")
+            clock["now"] += 30.0
+            advisor._call("価格の根拠をもう一度")
+            self.assertEqual(1, sink.post.call_count)
+            self.assertEqual(1, state.snapshot()["suppressed"])
+            clock["now"] += 200.0  # 冷却窗（180s）已过
+            advisor._call("価格の根拠は？")
+        self.assertEqual(2, sink.post.call_count)
+        self.assertEqual(2, state.snapshot()["delivered"])
+
+    def test_delivered_advice_is_fed_back_into_the_prompt(self) -> None:
+        # 换措辞的同义重复（实测相似度仅 0.56）代码闸拦不住——只有模型
+        # 看得懂"同一个意思"，但它必须先看到自己说过什么。规格：上过屏
+        # 的建议原文回灌进下一次调用的提示词。
+        cfg = GatewayConfig()
+        cfg.advisor_backend = "claude"
+        sink = Mock()
+        brain = Mock()
+        brain.advise.return_value = "要点: ⚠ 别当场答应交期前倒"
+        brain.last_stop_reason = "end_turn"
+        with patch("audio_gateway.advisor._ClaudeBrain") as brain_type:
+            brain_type.return_value = brain
+            advisor = Advisor(cfg, sink)
+
+        advisor._call("納品を前倒しできませんか")
+        first_prompt = brain.advise.call_args.args[0]
+        self.assertNotIn("你最近已提示过的内容", first_prompt)
+
+        brain.advise.return_value = "（观望）"
+        advisor._call("前倒しの件、いかがでしょうか")
+        second_prompt = brain.advise.call_args.args[0]
+        self.assertIn("你最近已提示过的内容", second_prompt)
+        self.assertIn("⚠ 别当场答应交期前倒", second_prompt)
+
+
 class AdvisorReliabilityTests(unittest.TestCase):
     """阶段 E-1/E-2/E-3：失败退避、观望抑制、可观测状态、brief 热重载。"""
 
@@ -587,7 +681,7 @@ class AdvisorReliabilityTests(unittest.TestCase):
         state = AdvisorState(enabled=True)
         brain = Mock()
         brain.advise.return_value = (
-            "（背景不符）\n局势: 正在定日程\n建议: 顺势确认时间"
+            "（背景不符）\n要点: 可顺势确认时间"
         )
         brain.last_stop_reason = "end_turn"
         advisor, sink = self._advisor(brain, state=state)
@@ -597,7 +691,7 @@ class AdvisorReliabilityTests(unittest.TestCase):
         self.assertTrue(state.snapshot()["brief_mismatch"])
         delivered = sink.post.call_args.args[0]
         self.assertNotIn("（背景不符）", delivered)
-        self.assertIn("顺势确认时间", delivered)
+        self.assertIn("可顺势确认时间", delivered)
 
     def test_claude_brain_reports_stop_reason_and_drops_truncated_text(
         self,

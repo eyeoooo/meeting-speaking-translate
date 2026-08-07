@@ -63,6 +63,13 @@ private final class CaptionLane {
         render()
     }
 
+    /// 整块替换（AI 建议通道用）：屏上永远只有当前一条，不堆历史。
+    /// 会中的人只有一瞥的注意力；历史仍在 advice.jsonl 与网页面板里。
+    func replace(_ text: String) {
+        lines = text.components(separatedBy: "\n")
+        render()
+    }
+
     func setDraft(_ text: String) {
         guard draft != text else { return }
         draft = text
@@ -109,7 +116,8 @@ private final class CaptionLane {
 final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegate {
     private let zhLane = CaptionLane(title: "中文（同传）", fontSize: 17)
     private let jaLane = CaptionLane(title: "日本語（原文）", fontSize: 12)
-    private let adviceLane = CaptionLane(title: "AI 建议", fontSize: 13, maxLines: 40)
+    // 建议是替换语义（一次一条），字号取比字幕大——为"一瞥"设计
+    private let adviceLane = CaptionLane(title: "AI 建议", fontSize: 15, maxLines: 4)
     // M1 发言排练：我的中文转写与日语译文（对方听不到，仅自查）。
     // 两条流粒度天然不等，同一泳道按到达序交错，前缀区分 说/訳。
     private let rehearsalLane = CaptionLane(
@@ -278,10 +286,10 @@ final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegat
                 for record in (json["rehearsal_segments"] as? [[String: Any]]) ?? [] {
                     self.applyRehearsalSegment(record)
                 }
-                for record in (json["advice"] as? [[String: Any]]) ?? [] {
-                    if let markdown = record["markdown"] as? String {
-                        self.adviceLane.append(markdown)
-                    }
+                // 建议通道是替换语义：断线重连/中途打开窗口只取最后一条。
+                if let markdown = ((json["advice"] as? [[String: Any]]) ?? [])
+                    .last?["markdown"] as? String {
+                    self.adviceLane.replace(markdown)
                 }
             }
         }.resume()
@@ -305,7 +313,7 @@ final class MeetingCaptionsWindowController: NSWindowController, NSWindowDelegat
             applyRehearsalSegment(json)
         case "advice":
             if let markdown = json["markdown"] as? String {
-                adviceLane.append("── \(timestampNow()) ──\n\(markdown)")
+                adviceLane.replace("\(timestampNow())  \(markdown)")
             }
         case "state":
             reconnectDelay = 3
