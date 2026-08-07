@@ -26,7 +26,8 @@ from .postmeeting import redact_error
 # 命中即触发（可用 --advisor-hotwords 追加）
 DEFAULT_HOTWORDS = (
     "価格", "金額", "見積", "納期", "契約", "期限", "御社", "決定",
-    "报价", "价格", "多少钱", "合同", "期限", "决定", "方案",
+    "予算", "年収",
+    "报价", "价格", "多少钱", "合同", "期限", "决定", "方案", "预算",
     "price", "cost", "deadline", "contract", "budget", "decision",
 )
 
@@ -467,6 +468,12 @@ class Advisor:
         # 同义重复（实测相似度仅 0.56）代码闸拦不住，只有模型看得懂
         # "同一个意思"，但它必须先看到自己说过什么。
         self._recent_advice: deque[tuple[float, str, str]] = deque(maxlen=8)
+        # 冷却阴影补触发（模拟面试全链路实锤）：「本日はよろしくお願い
+        # します。まず自己紹介をお願いします。」两句连发——寒暄句抢走
+        # 触发，真正的请求句落进冷却阴影被丢，面试第一题整题静默。
+        # 触发句被冷却压住时挂起为 (句子, 就绪时刻)，工作者在就绪时刻
+        # 补触发；新的触发句到来会顶替旧 pending（只保最新）。
+        self._pending_trigger: tuple[str, float] | None = None
         # 错误文本必须脱敏后才能进状态/日志（shutdown_secrets 同款约定）。
         self._secret_values = tuple(
             value.strip()
@@ -694,13 +701,42 @@ class Advisor:
 
     def _run(self) -> None:
         while True:
-            sentence = self._q.get()
+            timeout = None
+            if self._pending_trigger is not None:
+                timeout = max(
+                    self._pending_trigger[1] - time.monotonic(), 0.05
+                )
+            try:
+                sentence = (
+                    self._q.get(timeout=timeout)
+                    if timeout is not None
+                    else self._q.get()
+                )
+            except queue.Empty:
+                # 冷却到期：补触发挂起的句子。_should_call 重新如实判定
+                # ——退避窗内它会拒绝，此时挂起句直接放弃（上游在故障）。
+                pending, _ = self._pending_trigger
+                self._pending_trigger = None
+                if self._should_call(pending):
+                    self._call(pending)
+                continue
             if sentence is None:
                 return
             self._append(sentence)
             self._new_since_call += 1
             if self._should_call(sentence):
+                self._pending_trigger = None
                 self._call(sentence)
+            else:
+                need = None
+                if _is_direct_ask(sentence):
+                    need = _ASK_COOLDOWN_S
+                elif any(w in sentence for w in self._hotwords):
+                    need = _HOTWORD_COOLDOWN_S
+                if need is not None:
+                    self._pending_trigger = (
+                        sentence, self._last_call_t + need
+                    )
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="advisor", daemon=True)

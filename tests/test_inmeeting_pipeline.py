@@ -543,6 +543,35 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
                 advisor._should_call("次回は水曜でよろしいですか。")
             )
 
+    def test_ask_in_cooldown_shadow_fires_after_cooldown(self) -> None:
+        # 模拟面试全链路实锤：寒暄句抢走触发后，紧随的真正请求句
+        # 落进冷却阴影被整题丢弃（面试第一题零卡片）。规格：被冷却
+        # 压住的触发句挂起，冷却到期由工作者补触发。
+        cfg = GatewayConfig()
+        cfg.advisor_backend = "claude"
+        brain = Mock()
+        brain.advise.return_value = "（观望）"
+        brain.last_stop_reason = "end_turn"
+        with patch("audio_gateway.advisor._ClaudeBrain") as brain_type:
+            brain_type.return_value = brain
+            advisor = Advisor(cfg, Mock())
+        with patch("audio_gateway.advisor._ASK_COOLDOWN_S", 0.3):
+            advisor.start()
+            advisor.on_sentence("本日はよろしくお願いします。")
+            deadline = time.monotonic() + 2.0
+            while brain.advise.call_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(1, brain.advise.call_count)
+            # 冷却阴影内的第二个请求句：不丢，0.3s 后补触发
+            advisor.on_sentence("まず、簡単に自己紹介をお願いします。")
+            deadline = time.monotonic() + 3.0
+            while brain.advise.call_count < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            advisor.stop()
+        self.assertEqual(2, brain.advise.call_count)
+        second_prompt = brain.advise.call_args_list[1].args[0]
+        self.assertIn("自己紹介", second_prompt)
+
     def test_missing_script_on_a_question_triggers_one_retry(self) -> None:
         # 提问必须有话术（基础职责）；模型偶发只给要点时由代码补一枪，
         # 拿到话术用补问结果；非提问触发的卡不补问。
