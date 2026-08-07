@@ -484,6 +484,39 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
         self.assertEqual(2, sink.post.call_count)
         self.assertEqual(2, state.snapshot()["delivered"])
 
+    def test_direct_questions_trigger_immediately_with_cooldown(self) -> None:
+        # 基础功能（2026-08-07 用户裁定）：回复提示的价值窗口是对方问完
+        # 的那几秒。提问/请求句（句尾か/？/ください）绕过常规节流即刻
+        # 触发；冷却与热词同款，陈述句仍走常规节流。
+        cfg = GatewayConfig()
+        cfg.advisor_backend = "claude"
+        with patch("audio_gateway.advisor._ClaudeBrain"):
+            advisor = Advisor(cfg, Mock())
+        clock = {"now": 1000.0}
+        with patch(
+            "audio_gateway.advisor.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            advisor._new_since_call = 1  # 低于常规节流的最少新句数
+            self.assertTrue(
+                advisor._should_call("進捗状況を教えていただけますか。")
+            )
+            self.assertTrue(advisor._should_call("進捗はどう?"))
+            self.assertTrue(
+                advisor._should_call("レポートを本日中にお送りください。")
+            )
+            # 陈述句：不即触发，走常规节流
+            self.assertFalse(advisor._should_call("承知しました。"))
+            # 冷却内的提问不重复触发
+            advisor._last_call_t = clock["now"]
+            self.assertFalse(
+                advisor._should_call("次回は水曜でよろしいですか。")
+            )
+            clock["now"] += 9.0  # 过了 8s 冷却
+            self.assertTrue(
+                advisor._should_call("次回は水曜でよろしいですか。")
+            )
+
     def test_delivered_advice_is_fed_back_into_the_prompt(self) -> None:
         # 换措辞的同义重复（实测相似度仅 0.56）代码闸拦不住——只有模型
         # 看得懂"同一个意思"，但它必须先看到自己说过什么。规格：上过屏
