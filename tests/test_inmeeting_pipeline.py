@@ -20,7 +20,8 @@ sys.path.insert(0, str(AUDIO_GATEWAY_ROOT))
 
 from audio_gateway import main  # noqa: E402
 from audio_gateway.advisor import (  # noqa: E402
-    ADVICE_POINT_MAX_CHARS,
+    ADVICE_CUE_MAX_CHARS,
+    ADVICE_HEAD_MAX_CHARS,
     Advisor,
     AdvisorState,
     CallbackAdvisorSink,
@@ -423,47 +424,54 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
     契约=最多两行（要点/话术），由代码执行；重复建议 3 分钟冷却。
     """
 
-    def test_contract_lines_survive_and_everything_else_is_dropped(self) -> None:
-        # 模型若退回旧四段格式，契约外的行必须被代码丢掉。
+    def test_cue_card_format_is_parsed_and_capped(self) -> None:
+        # 提示卡契约（2026-08-08 用户裁定：主脉络非全文）：点题行 +
+        # ≤3 条「・」脉络行 + 可选「話:」开口句；第 4 条脉络与契约外
+        # 解说行全部丢弃。
         out = condense_advice(
-            "局势: 正在谈交期\n"
-            "要点: ⚠ 对方要的交期早两周\n"
-            "话术: 納期は持ち帰って確認します。（交期带回确认）\n"
-            "风险: 对方在压价"
+            "失敗談→成長弧線\n"
+            "・設計書不足で手戻り2日\n"
+            "・三つの確認を徹底\n"
+            "・今のレビュー担当の土台\n"
+            "・第四条应被丢弃\n"
+            "此外的解说行也应被丢弃\n"
+            "話: 入社一年目の話ですが。"
         )
         self.assertEqual(
-            "⚠ 对方要的交期早两周\n"
-            "话术: 納期は持ち帰って確認します。（交期带回确认）",
+            "失敗談→成長弧線\n"
+            "・設計書不足で手戻り2日\n"
+            "・三つの確認を徹底\n"
+            "・今のレビュー担当の土台\n"
+            "話: 入社一年目の話ですが。",
             out,
         )
 
-    def test_long_point_is_truncated_and_long_script_is_dropped(self) -> None:
-        # 要点超限截断（标题被剪仍是标题）；话术真失控（剥掉中文对照后
-        # 纯日语仍超限）才整行丢弃——绝不截半句（半句话术照着念出口
-        # 比没有更危险，与 max_tokens 截断同一裁定）。
+    def test_legacy_two_line_format_maps_to_cue_card(self) -> None:
+        # 旧两行格式（要点:/话术:）自动映射：要点→点题行，话术→話 行。
         out = condense_advice(
-            f"要点: {'长' * 60}\n话术: {'あ' * 200}"
-        )
-        self.assertIsNotNone(out)
-        lines = out.splitlines()
-        self.assertEqual(1, len(lines))
-        self.assertEqual("长" * ADVICE_POINT_MAX_CHARS + "…", lines[0])
-
-    def test_overlong_script_sheds_gloss_to_keep_the_speakable_part(self) -> None:
-        # 面试对抗实锤：模型给的好话术（日语原话+中文对照 135 字）曾被
-        # 旧 80 字闸静默砍掉——话术是念的不是读的。超限时先剥（中文
-        # 对照）保住可念的日语，只有纯日语仍超限才丢。
-        speakable = "は" * 100
-        out = condense_advice(
-            f"要点: 报年限与技术栈\n话术: {speakable}（{'长' * 100}）"
+            "局势: 正在谈交期\n"
+            "要点: ⚠ 交期早两周别答应\n"
+            "话术: 納期は持ち帰って確認します。\n"
+            "风险: 对方在压价"
         )
         self.assertEqual(
-            f"报年限与技术栈\n话术: {speakable}", out
+            "⚠ 交期早两周别答应\n話: 納期は持ち帰って確認します。",
+            out,
         )
-        # 正常体量（≤160 字含对照）原样保留
-        kept = "御社が第一志望です。（贵司是第一志望）"
-        out2 = condense_advice(f"要点: 别承诺独家\n话术: {kept}")
-        self.assertEqual(f"别承诺独家\n话术: {kept}", out2)
+
+    def test_overlong_lines_are_truncated_and_script_sheds_gloss(self) -> None:
+        # 点题/脉络行超限截断（线索被剪仍是线索）；開口句超限先剥
+        # （中文对照）保可念日语，纯日语仍超限才整行丢——绝不截半句。
+        out = condense_advice(
+            f"{'长' * 30}\n・{'点' * 30}\n話: {'は' * 30}（{'长' * 40}）"
+        )
+        lines = out.splitlines()
+        self.assertEqual("长" * ADVICE_HEAD_MAX_CHARS + "…", lines[0])
+        self.assertEqual("・" + "点" * ADVICE_CUE_MAX_CHARS + "…", lines[1])
+        self.assertEqual("話: " + "は" * 30, lines[2])
+        # 纯日语开口句仍超限：整行丢
+        out2 = condense_advice(f"报期望年收\n話: {'は' * 100}")
+        self.assertEqual("报期望年收", out2)
 
     def test_freeform_output_falls_back_to_first_line_only(self) -> None:
         # 模型完全不守格式时：第一行非空文本兜底成要点，永远最多两行。
@@ -605,18 +613,18 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
         sink.post.assert_not_called()
         self.assertEqual(1, state.snapshot()["delivered"])
 
-    def test_missing_script_on_a_question_triggers_one_retry(self) -> None:
-        # 提问必须有话术（基础职责）；模型偶发只给要点时由代码补一枪，
-        # 拿到话术用补问结果；非提问触发的卡不补问。
+    def test_cue_only_card_is_delivered_without_extra_retry(self) -> None:
+        # 提示卡契约下，点题+脉络（无話行）就是完整卡片——不再为
+        # "缺话术"补问（記憶線索裁定：脉络已足够，開口句仅措辞
+        # 敏感时出现）。
         cfg = GatewayConfig()
         cfg.advisor_backend = "claude"
         state = AdvisorState(enabled=True)
         sink = Mock()
         brain = Mock()
-        brain.advise.side_effect = [
-            "要点: 用对账引擎举证",
-            "要点: 用对账引擎举证\n话术: 直近では消込エンジンを実装しました。（最近实现了对账引擎）",
-        ]
+        brain.advise.return_value = (
+            "用消込エンジン举证\n・毎週コードを書く\n・直近コア実装"
+        )
         brain.last_stop_reason = "end_turn"
         with patch("audio_gateway.advisor._ClaudeBrain") as brain_type:
             brain_type.return_value = brain
@@ -624,16 +632,12 @@ class AdvisorGlanceabilityTests(unittest.TestCase):
 
         advisor._call("ご自身で実装された部分はありますか。")
 
-        self.assertEqual(2, brain.advise.call_count)
-        self.assertIn("话术行缺失", brain.advise.call_args.args[0])
+        self.assertEqual(1, brain.advise.call_count)
         delivered = sink.post.call_args.args[0]
-        self.assertIn("话术: 直近では消込エンジンを実装しました。", delivered)
-        self.assertEqual(2, state.snapshot()["calls"])
-
-        # 陈述句触发（常规节流路径）缺话术不补问
-        brain.advise.side_effect = ["要点: 对方在赶进度，可主动汇报风险"]
-        advisor._call("スケジュールが厳しくなってきました。")
-        self.assertEqual(3, brain.advise.call_count)
+        self.assertEqual(
+            "用消込エンジン举证\n・毎週コードを書く\n・直近コア実装",
+            delivered,
+        )
 
     def test_delivered_advice_is_fed_back_into_the_prompt(self) -> None:
         # 换措辞的同义重复（实测相似度仅 0.56）代码闸拦不住——只有模型
