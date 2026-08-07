@@ -36,7 +36,7 @@ struct UserAlert {
     let guidance: [String]  // 点开后的检查清单
 }
 
-final class GatewayController: NSObject, NSApplicationDelegate {
+final class GatewayController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // TASK-20260730-008 restore point: server mute/uplink support stays intact, but
     // the receive-only product menu must not expose speaking controls. Set true
     // only after the remote channel gains direct microphone support and acceptance
@@ -70,6 +70,8 @@ final class GatewayController: NSObject, NSApplicationDelegate {
     private let cancelItem = NSMenuItem(title: "取消这次录音（不生成纪要）", action: #selector(cancelMeeting), keyEquivalent: "")
     private let subtitleToggle = NSMenuItem(title: "实时中文字幕", action: #selector(toggleSubtitles), keyEquivalent: "")
     private let adviceToggle = NSMenuItem(title: "AI 建议", action: #selector(toggleAdvice), keyEquivalent: "")
+    // 人物画像子菜单：打开时动态列出 profiles/ 下的画像（menuNeedsUpdate）
+    private let profileMenu = NSMenu()
     // 声音来源：这台 Mac mini 的会议声音从哪来。产品裁定（2026-07-30）——
     // 会议模块是通用中枢，KVM 被控机只是音源之一；本机跑 Teams/Zoom 时
     // 声音在系统内部，要靠虚拟音频设备（BlackHole）接进来。
@@ -282,8 +284,11 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         menu.addItem(folder)
         // 会前准备的正门（2026-08-07 裁定：简历/JD/口径这类背景资料
         // 就该开会前写进 brief）——参谋话术质量的上限就是 brief 的细致度。
-        let brief = NSMenuItem(title: "编辑会议背景（brief）", action: #selector(openBrief), keyEquivalent: "")
-        brief.target = self
+        // 人物画像库：profiles/ 下每人一份画像，子菜单一键切换（brief.md
+        // 变为指向画像的符号链接，编辑与热重载都落在同一份画像上）。
+        let brief = NSMenuItem(title: "会议背景（人物画像）", action: nil, keyEquivalent: "")
+        profileMenu.delegate = self
+        brief.submenu = profileMenu
         menu.addItem(brief)
         menu.addItem(.separator())
 
@@ -1150,8 +1155,82 @@ final class GatewayController: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(meetingsRoot)
     }
 
+    private var profilesRoot: URL {
+        meetingsRoot.appendingPathComponent("profiles")
+    }
+
+    private var briefURL: URL {
+        meetingsRoot.appendingPathComponent("brief.md")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === profileMenu else { return }
+        rebuildProfileMenu()
+    }
+
+    private func rebuildProfileMenu() {
+        profileMenu.removeAllItems()
+        let edit = NSMenuItem(title: "编辑当前背景…", action: #selector(openBrief), keyEquivalent: "")
+        edit.target = self
+        profileMenu.addItem(edit)
+        let folder = NSMenuItem(title: "打开画像文件夹", action: #selector(openProfilesFolder), keyEquivalent: "")
+        folder.target = self
+        profileMenu.addItem(folder)
+        let profiles = ((try? FileManager.default.contentsOfDirectory(
+            at: profilesRoot, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "md" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !profiles.isEmpty else { return }
+        profileMenu.addItem(.separator())
+        let active = activeProfilePath()
+        for url in profiles {
+            let item = NSMenuItem(
+                title: url.deletingPathExtension().lastPathComponent,
+                action: #selector(selectProfile(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = url
+            item.state = url.standardizedFileURL.path == active ? .on : .off
+            profileMenu.addItem(item)
+        }
+    }
+
+    private func activeProfilePath() -> String? {
+        guard let dest = try? FileManager.default.destinationOfSymbolicLink(
+            atPath: briefURL.path) else { return nil }
+        return URL(fileURLWithPath: dest,
+                   relativeTo: briefURL.deletingLastPathComponent())
+            .standardizedFileURL.path
+    }
+
+    @objc private func openProfilesFolder() {
+        try? FileManager.default.createDirectory(
+            at: profilesRoot, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(profilesRoot)
+    }
+
+    @objc private func selectProfile(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? URL else { return }
+        let fm = FileManager.default
+        // brief.md 是普通文件（手写的临时背景）时先抢救进画像库——
+        // 切换画像绝不能弄丢用户写过的内容。
+        if fm.fileExists(atPath: briefURL.path),
+           (try? fm.destinationOfSymbolicLink(atPath: briefURL.path)) == nil {
+            let stamp = DateFormatter()
+            stamp.dateFormat = "yyyyMMdd-HHmmss"
+            try? fm.createDirectory(
+                at: profilesRoot, withIntermediateDirectories: true)
+            try? fm.moveItem(
+                at: briefURL,
+                to: profilesRoot.appendingPathComponent(
+                    "原背景-\(stamp.string(from: Date())).md"))
+        }
+        try? fm.removeItem(at: briefURL)
+        try? fm.createSymbolicLink(at: briefURL, withDestinationURL: target)
+        // 会中切换即刻生效：advisor 的热重载按 mtime 追随符号链接目标。
+    }
+
     @objc private func openBrief() {
-        let brief = meetingsRoot.appendingPathComponent("brief.md")
+        let brief = briefURL
         if !FileManager.default.fileExists(atPath: brief.path) {
             // 首次打开落一份骨架：告诉用户写什么、去哪找完整模板。
             // 绝不覆盖已有文件——brief 是用户的会前准备成果。
@@ -1165,6 +1244,8 @@ final class GatewayController: NSObject, NSApplicationDelegate {
               已知风险、对方情况
 
             完整模板见仓库 docs/brief-templates/（interview.md / meeting.md）。
+            多个人物的画像放在 profiles/ 目录（每人一个 .md），
+            菜单「会议背景（人物画像）」可一键切换。
             会议中途修改本文件会自动生效，无需重启。
             """
             try? FileManager.default.createDirectory(
